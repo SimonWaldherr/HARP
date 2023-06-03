@@ -1,9 +1,10 @@
 package harp
 
 import (
-	"github.com/gorilla/websocket"
 	"regexp"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 type HTTPRequest struct {
@@ -31,7 +32,8 @@ type Route struct {
 	Status   Status          `json:"-"` // We store the status of the route here
 	Pattern  *regexp.Regexp  `json:"-"` // We store the compiled regular expression here
 	Conn     *websocket.Conn `json:"-"` // We store the WebSocket connection here
-	Handler func(*HTTPRequest) `json:"-"` // We store the handler here
+	//Handler func(*HTTPRequest) `json:"-"` // We store the handler here
+	Handler HandlerFunc `json:"-"`
 }
 
 type Registration struct {
