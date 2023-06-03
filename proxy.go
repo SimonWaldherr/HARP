@@ -10,55 +10,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+	
+	. "./harp"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 )
-
-// HTTPRequest is the request sent from the Proxy to the App
-type HTTPRequest struct {
-	Method     string            `json:"method"`
-	URL        string            `json:"url"`
-	Headers    map[string]string `json:"headers"`
-	Body       string            `json:"body"`
-	ResponseId string            `json:"responseId"`
-}
-
-// Route is a route that the App registers with the Proxy
-type Route struct {
-	Name     string          `json:"name"`
-	Path     string          `json:"path"`
-	RegExp   string          `json:"regexp"`
-	Port     int             `json:"port"`
-	Domain   string          `json:"domain"`
-	IPorHost string          `json:"ipOrHost"`
-	Status   Status          `json:"-"` // We store the status of the route here
-	Pattern  *regexp.Regexp  `json:"-"` // We store the compiled regular expression here
-	Conn     *websocket.Conn `json:"-"` // We store the WebSocket connection here
-}
-
-// Registration is the message sent from the App to the Proxy to register routes
-type Registration struct {
-	Name   string  `json:"name"`
-	Domain string  `json:"domain"`
-	Key    string  `json:"key"`
-	Routes []Route `json:"routes"`
-}
-
-// Status is the status of a route
-type Status struct {
-	Online      bool      `json:"online"`
-	LastRequest time.Time `json:"lastRequest"`
-}
-
-// HTTPResponse is the response sent from the App to the Proxy
-type HTTPResponse struct {
-	Status     int               `json:"status"`
-	Headers    map[string]string `json:"headers"`
-	Body       string            `json:"body"`
-	ResponseId string            `json:"responseId"`
-}
 
 // A map to store routes. You can use a more sophisticated structure for better performance
 var routes map[string][]Route

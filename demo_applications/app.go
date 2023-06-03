@@ -4,43 +4,11 @@ import (
 	"fmt"
 	"log"
 	"time"
+	
+	. "../harp"
 
 	"github.com/gorilla/websocket"
 )
-
-// Registration is the message sent from the App to the Proxy to register routes
-type Registration struct {
-	Name   string  `json:"name"`
-	Domain string  `json:"domain"`
-	Key    string  `json:"key"`
-	Routes []Route `json:"routes"`
-}
-
-// Route is a route that the App registers with the Proxy
-type Route struct {
-	Name    string             `json:"name"`
-	RegExp  string             `json:"regexp"`
-	Path    string             `json:"path"`
-	Port    int                `json:"port"`
-	Handler func(*HTTPRequest) `json:"-"` // We store the handler here
-}
-
-// HTTPRequest is the request sent from the Proxy to the App
-type HTTPRequest struct {
-	Method     string            `json:"method"`
-	URL        string            `json:"url"`
-	Headers    map[string]string `json:"headers"`
-	Body       string            `json:"body"`
-	ResponseId string            `json:"responseId"`
-}
-
-// HTTPResponse is the response sent from the App to the Proxy
-type HTTPResponse struct {
-	Status     int               `json:"status"`
-	Headers    map[string]string `json:"headers"`
-	Body       string            `json:"body"`
-	ResponseId string            `json:"responseId"`
-}
 
 // WebSocket connection to the Proxy server
 var ws *websocket.Conn
