@@ -6,7 +6,7 @@ HARP (HTTP Autoregister Reverse Proxy) is an inverting reverse proxy server whic
 
 **HARP is currently WIP and not production ready.**
 
-## How it works
+## how it works
 
 * The proxy server listens for incoming HTTP requests.
 * Backend applications register themselves by connecting via WebSocket and sending routing-information.
@@ -14,9 +14,19 @@ HARP (HTTP Autoregister Reverse Proxy) is an inverting reverse proxy server whic
 * If a matching backend is found, the proxy server forwards the request to the backend and returns the backend's response to the client.
 * If no matching backend is found, the proxy server returns a 404 Not Found error.
 
-## Usage
+## usage
 
 Deploy the proxy server on a publicly accessible server.
 Start your backend application (it even works on a non-publicly accessible server).
 
+## use cases
 
+the final project will help you for the following demands:
+
+* Caching
+* Dynamic Scaling and Load Balancing
+* Service Migration
+* Internal Tooling and Debugging
+* Local Development
+* Microservices Development
+* Temporary Services
