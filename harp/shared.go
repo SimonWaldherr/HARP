@@ -1,6 +1,7 @@
 package harp
 
 import (
+	"net/http"
 	"regexp"
 	"time"
 
@@ -13,13 +14,16 @@ type HTTPRequest struct {
 	Headers    map[string]string `json:"headers"`
 	Body       string            `json:"body"`
 	ResponseId string            `json:"responseId"`
+	Timestamp  time.Time         `json:"timestamp"`
 }
 
 type HTTPResponse struct {
 	Status     int               `json:"status"`
+	StatusCode int               `json:"statusCode"`
 	Headers    map[string]string `json:"headers"`
 	Body       string            `json:"body"`
 	ResponseId string            `json:"responseId"`
+	Timestamp  time.Time         `json:"timestamp"`
 }
 
 type Route struct {
@@ -33,7 +37,8 @@ type Route struct {
 	Pattern  *regexp.Regexp  `json:"-"` // We store the compiled regular expression here
 	Conn     *websocket.Conn `json:"-"` // We store the WebSocket connection here
 	//Handler func(*HTTPRequest) `json:"-"` // We store the handler here
-	Handler HandlerFunc `json:"-"`
+	//Handler HandlerFunc `json:"-"`
+	Handler http.HandlerFunc `json:"-"`
 }
 
 type Registration struct {
@@ -45,6 +50,7 @@ type Registration struct {
 
 // Status is the status of a route
 type Status struct {
-	Online      bool      `json:"online"`
-	LastRequest time.Time `json:"lastRequest"`
+	Online       bool      `json:"online"`
+	LastRequest  time.Time `json:"lastRequest"`
+	LastResponse time.Time `json:"lastResponse"`
 }

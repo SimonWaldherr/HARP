@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"time"
 
 	harp "../harp"
@@ -11,29 +12,21 @@ import (
 func main() {
 	server := harp.NewServer()
 
-	server.HandleFunc("/pages/123", func(req *harp.HTTPRequest, respond func(*harp.HTTPResponse) error) {
-		res := &harp.HTTPResponse{
-			Status:     200,
-			Headers:    map[string]string{"Content-Type": "text/plain"},
-			Body:       fmt.Sprintf("Hello from App.go!\n%s - %s\n%s\n", req.Method, req.URL, time.Now().Format(time.RFC3339)),
-			ResponseId: req.ResponseId,
-		}
-
-		if err := respond(res); err != nil {
-			log.Println("Error sending response:", err)
+	server.HandleFunc("/pages/123", func(w http.ResponseWriter, r *http.Request) {
+		body := fmt.Sprintf("Hello from App.go!\n%s - %s\n%s\n", r.Method, r.URL, time.Now().Format(time.RFC3339))
+		w.Header().Set("Content-Type", "text/plain")
+		_, err := w.Write([]byte(body))
+		if err != nil {
+			log.Println("Error writing response:", err)
 		}
 	})
 
-	server.HandleFunc("/robots.txt", func(req *harp.HTTPRequest, respond func(*harp.HTTPResponse) error) {
-		res := &harp.HTTPResponse{
-			Status:     200,
-			Headers:    map[string]string{"Content-Type": "text/plain"},
-			Body:       fmt.Sprint("User-agent: *\nDisallow: /"),
-			ResponseId: req.ResponseId,
-		}
-
-		if err := respond(res); err != nil {
-			log.Println("Error sending response:", err)
+	server.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		body := "User-agent: *\nDisallow: /"
+		w.Header().Set("Content-Type", "text/plain")
+		_, err := w.Write([]byte(body))
+		if err != nil {
+			log.Println("Error writing response:", err)
 		}
 	})
 

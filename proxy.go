@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
-	
+
 	. "./harp"
 
 	"github.com/google/uuid"
@@ -161,7 +161,6 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		for name, value := range res.Headers {
 			w.Header().Set(name, value)
 		}
-		w.WriteHeader(res.Status)
 		fmt.Fprint(w, res.Body)
 		mutex.Lock()
 		delete(pendingResponses, id.String())
