@@ -8,6 +8,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// HTTPRequest is a HTTP request from Harp to the app enclosed in a WebSocket message
 type HTTPRequest struct {
 	Method     string            `json:"method"`
 	URL        string            `json:"url"`
@@ -17,6 +18,7 @@ type HTTPRequest struct {
 	Timestamp  time.Time         `json:"timestamp"`
 }
 
+// HTTPResponse is a HTTP response from the app to Harp enclosed in a WebSocket message
 type HTTPResponse struct {
 	Status     int               `json:"status"`
 	StatusCode int               `json:"statusCode"`
@@ -26,6 +28,7 @@ type HTTPResponse struct {
 	Timestamp  time.Time         `json:"timestamp"`
 }
 
+// Route is a route that Harp will proxy to the app
 type Route struct {
 	Name     string          `json:"name"`
 	Path     string          `json:"path"`
@@ -41,6 +44,7 @@ type Route struct {
 	Handler http.HandlerFunc `json:"-"`
 }
 
+// Registration is a registration message from an app to Harp enclosed in a WebSocket message
 type Registration struct {
 	Name   string  `json:"name"`
 	Domain string  `json:"domain"`

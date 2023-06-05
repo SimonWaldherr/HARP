@@ -6,12 +6,14 @@ import (
 	"net/http"
 	"time"
 
-	harp "../harp"
+	"github.com/SimonWaldherr/HARP/harp"
 )
 
 func main() {
+	// Create a new server
 	server := harp.NewServer()
 
+	// Register a handler for the /pages/123 route
 	server.HandleFunc("/pages/123", func(w http.ResponseWriter, r *http.Request) {
 		body := fmt.Sprintf("Hello from App.go!\n%s - %s\n%s\n", r.Method, r.URL, time.Now().Format(time.RFC3339))
 		w.Header().Set("Content-Type", "text/plain")
@@ -21,6 +23,7 @@ func main() {
 		}
 	})
 
+	// Register a handler for the /robots.txt route
 	server.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
 		body := "User-agent: *\nDisallow: /"
 		w.Header().Set("Content-Type", "text/plain")
@@ -30,6 +33,7 @@ func main() {
 		}
 	})
 
+	// Start the server
 	if err := server.ListenAndServe("ws://localhost:8080/ws"); err != nil {
 		log.Fatal(err)
 	}

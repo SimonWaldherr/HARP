@@ -1,21 +1,27 @@
 package harp
 
 import (
+	"crypto/tls"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 
 	"github.com/gorilla/websocket"
 )
 
+// Server is a Harp server
 type Server struct {
 	routes []Route
 }
 
+// NewServer creates a new server
 func NewServer() *Server {
 	return &Server{}
 }
 
+// HandleFunc registers a handler for the given path
 func (s *Server) HandleFunc(path string, handler http.HandlerFunc) {
 	route := Route{
 		Name:    "App-pages",
@@ -26,18 +32,92 @@ func (s *Server) HandleFunc(path string, handler http.HandlerFunc) {
 	s.routes = append(s.routes, route)
 }
 
-func (s *Server) ListenAndServe(addr string) error {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		for _, route := range s.routes {
-			if r.URL.Path == route.Path {
-				route.Handler(w, r)
-				break
+// handleMessage handles a message from Harp
+func (s *Server) handleMessage(conn *websocket.Conn, message []byte) error {
+	// Parse the message from Harp into a HTTPRequest struct
+	req := HTTPRequest{}
+	if err := json.Unmarshal(message, &req); err != nil {
+		log.Println("Error parsing message:", err)
+		return err
+	}
+
+	// Find the route that matches the request
+	for i, route := range s.routes {
+		if req.URL == route.Path {
+
+			// Create a new HTTPResponse struct
+			resp := HTTPResponse{
+				StatusCode: 200,
+				Body:       "Hello from Harp!",
 			}
+
+			// Create a response writer
+			w := httptest.NewRecorder()
+
+			// Create a request
+			r, err := http.NewRequest(req.Method, req.URL, nil)
+			if err != nil {
+				return err
+			}
+
+			// Call the handler for the route
+			s.routes[i].Handler(w, r)
+
+			// Get the response headers from the response writer
+			resp.Headers = make(map[string]string)
+			for k, v := range w.Header() {
+				resp.Headers[k] = v[0]
+			}
+
+			// Get the response from the response writer
+			resp.Body = w.Body.String()
+
+			// Get the response status code from the response writer
+			resp.StatusCode = w.Code
+
+			// Set the response ID
+			resp.ResponseId = req.ResponseId
+
+			// Set the response status
+			s.routes[i].Status.Online = true
+			s.routes[i].Status.LastRequest = req.Timestamp
+			s.routes[i].Status.LastResponse = resp.Timestamp
+
+			// Convert the HTTPResponse struct into a JSON string
+			respJSON, err := json.Marshal(resp)
+			if err != nil {
+				return err
+			}
+			// Send the JSON string to Harp
+			if err := conn.WriteMessage(websocket.TextMessage, respJSON); err != nil {
+				return err
+			}
+			break
 		}
-	})
+	}
+	return nil
+}
+
+// ListenAndServe listens on the TCP network address addr and then calls Serve
+func (s *Server) ListenAndServe(addr string) error {
+	// Check if there are any routes
+	if len(s.routes) == 0 {
+		return fmt.Errorf("No routes registered")
+	}
+
+	// Check if the address is valid
+	if addr == "" {
+		return fmt.Errorf("No address specified")
+	}
+
+	// prepare secure websocket connection
+	dialer := websocket.DefaultDialer
+	dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: false}
+	dialer.TLSClientConfig.ServerName = "harp"
+	dialer.EnableCompression = true
 
 	// Connect to Harp
-	conn, _, err := websocket.DefaultDialer.Dial(addr, nil)
+	conn, _, err := dialer.Dial(addr, nil)
 	if err != nil {
 		return err
 	}
@@ -64,67 +144,18 @@ func (s *Server) ListenAndServe(addr string) error {
 			return err
 		}
 
-		// Parse the message from Harp into a HTTPRequest struct
-		req := HTTPRequest{}
-		if err := json.Unmarshal(message, &req); err != nil {
-			return err
-		}
-
-		// Detect the route that the message is for
-		for i, route := range s.routes {
-			if req.URL == route.Path {
-
-				// Create a new HTTPResponse struct
-				resp := HTTPResponse{
-					StatusCode: 200,
-					Body:       "Hello from Harp!",
-				}
-
-				// Create a response writer
-				w := httptest.NewRecorder()
-
-				// Create a request
-				r, err := http.NewRequest(req.Method, req.URL, nil)
-				if err != nil {
-					return err
-				}
-
-				// Call the handler for the route
-				s.routes[i].Handler(w, r)
-
-				// Get the response headers from the response writer
-				resp.Headers = make(map[string]string)
-				for k, v := range w.Header() {
-					resp.Headers[k] = v[0]
-				}
-
-				// Get the response from the response writer
-				resp.Body = w.Body.String()
-
-				// Get the response status code from the response writer
-				resp.StatusCode = w.Code
-
-				// Set the response ID
-				resp.ResponseId = req.ResponseId
-
-				// Set the response status
-				s.routes[i].Status.Online = true
-				s.routes[i].Status.LastRequest = req.Timestamp
-				s.routes[i].Status.LastResponse = resp.Timestamp
-
-				// Convert the HTTPResponse struct into a JSON string
-				respJSON, err := json.Marshal(resp)
-				if err != nil {
-					return err
-				}
-				// Send the JSON string to Harp
-				if err := conn.WriteMessage(websocket.TextMessage, respJSON); err != nil {
-					return err
-				}
-				break
-			}
-		}
+		// Handle all messages from Harp concurrently
+		go s.handleMessage(conn, message)
 	}
 
 	return nil
+}
+
+// ListenAndServeWithAutoReconnect listens on the TCP network address addr and then calls Serve
+func (s *Server) ListenAndServeWithAutoReconnect(addr string) error {
+	for {
+		if err := s.ListenAndServe(addr); err != nil {
+			log.Println("Error:", err)
+		}
+	}
 }
