@@ -33,3 +33,46 @@ the final project will help you for the following demands:
 * Local Development
 * Microservices Development
 * Temporary Services
+
+## sequence diagram
+
+```mermaid
+sequenceDiagram
+    participant B1 as Backend Service 1
+    participant B2 as Backend Service 2
+    participant H as HARP
+    participant CM as Cache Mechanism
+    participant C as Client
+
+    B1->>H: WebSocket Registration (domain/path)
+    B2->>H: WebSocket Registration (domain/path)
+
+    loop Every 5s
+        H->>B1: WebSocket Ping
+        H->>B2: WebSocket Ping
+        B1-->>H: WebSocket Pong
+        B2-->>H: WebSocket Pong
+    end
+
+    C->>H: HTTP Request (domain/path)
+    H->>CM: Check for Cached Response
+    alt Cached Response Exists
+        CM->>H: Return Cached Response
+        H->>C: Return Cached Response
+    else No Cached Response
+        CM->>H: No Cached Response
+        alt Request Matches Backend 1
+            H->>B1: Forward Request to Backend 1
+            B1->>H: Response
+            H->>CM: Cache the Response
+            CM-->>H: Confirmation
+            H->>C: Return Response
+        else Request Matches Backend 2
+            H->>B2: Forward Request to Backend 2
+            B2->>H: Response
+            H->>CM: Cache the Response
+            CM-->>H: Confirmation
+            H->>C: Return Response
+        end
+    end
+```
