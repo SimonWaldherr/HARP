@@ -38,22 +38,30 @@ the final project will help you for the following demands:
 
 ```mermaid
 sequenceDiagram
+    box Application
     participant B1 as Backend Service 1
     participant B2 as Backend Service 2
+    end
+    box HARP
     participant H as HARP
     participant CM as Cache Mechanism
+    end
+    
+    box Client
     participant C as Client
-
+    end
+ 
     B1->>H: WebSocket Registration (domain/path)
     B2->>H: WebSocket Registration (domain/path)
-
+    Note over B1,H: the WebSocket connection stays open<br/>and is used for all further communication
+ 
     loop Every 5s
-        H->>B1: WebSocket Ping
-        H->>B2: WebSocket Ping
+        H-->>B1: WebSocket Ping
+        H-->>B2: WebSocket Ping
         B1-->>H: WebSocket Pong
         B2-->>H: WebSocket Pong
     end
-
+ 
     C->>H: HTTP Request (domain/path)
     H->>CM: Check for Cached Response
     alt Cached Response Exists
@@ -62,14 +70,14 @@ sequenceDiagram
     else No Cached Response
         CM->>H: No Cached Response
         alt Request Matches Backend 1
-            H->>B1: Forward Request to Backend 1
-            B1->>H: Response
+            H-->>B1: Forward Request to Backend 1
+            B1-->>H: Response
             H->>CM: Cache the Response
             CM-->>H: Confirmation
             H->>C: Return Response
         else Request Matches Backend 2
-            H->>B2: Forward Request to Backend 2
-            B2->>H: Response
+            H-->>B2: Forward Request to Backend 2
+            B2-->>H: Response
             H->>CM: Cache the Response
             CM-->>H: Confirmation
             H->>C: Return Response
