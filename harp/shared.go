@@ -10,12 +10,13 @@ import (
 
 // HTTPRequest is a HTTP request from Harp to the app enclosed in a WebSocket message
 type HTTPRequest struct {
-	Method     string            `json:"method"`
-	URL        string            `json:"url"`
-	Headers    map[string]string `json:"headers"`
-	Body       string            `json:"body"`
-	ResponseId string            `json:"responseId"`
-	Timestamp  time.Time         `json:"timestamp"`
+	Method      string            `json:"method"`
+	URL         string            `json:"url"`
+	Headers     map[string]string `json:"headers"`
+	HeadersHash string            `json:"headersHash"`
+	Body        string            `json:"body"`
+	ResponseId  string            `json:"responseId"`
+	Timestamp   time.Time         `json:"timestamp"`
 }
 
 // HTTPResponse is a HTTP response from the app to Harp enclosed in a WebSocket message
@@ -26,6 +27,8 @@ type HTTPResponse struct {
 	Body       string            `json:"body"`
 	ResponseId string            `json:"responseId"`
 	Timestamp  time.Time         `json:"timestamp"`
+	Cacheable  bool              `json:"cacheable"`
+	Latency    time.Duration     `json:"latency"`
 }
 
 // Route is a route that Harp will proxy to the app

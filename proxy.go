@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -34,6 +36,97 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
+}
+
+// HTTP Cache Structure
+type cacheEntry struct {
+	Expires time.Time
+	Content harp.HTTPResponse
+}
+
+// HTTP Cache
+var cache = make(map[string]cacheEntry)
+
+// cleanup request-struct for caching
+func cleanupRequest(req harp.HTTPRequest) harp.HTTPRequest {
+	h := sha256.New()
+	h.Write([]byte(req.Body))
+
+	req.Body = fmt.Sprintf("%x", h.Sum(nil))
+	req.Headers = make(map[string]string)
+	req.ResponseId = ""
+
+	return req
+}
+
+// insertCache inserts a new entry into the cache
+func insertCache(req harp.HTTPRequest, res harp.HTTPResponse) {
+	// check if request is cacheable
+	if res.StatusCode != 200 || res.Headers["Cache-Control"] == "no-cache" {
+		return
+	}
+
+	// check if request should be cached
+	if req.Method != "GET" {
+		return
+	}
+
+	// check if request is authenticated
+	if req.Headers["Authorization"] != "" {
+		return
+	}
+
+	// only cache Plain-Text like JSON, XML, HTML, CSS, JS, ... in memory
+	if !strings.HasPrefix(res.Headers["Content-Type"], "text/") {
+		return
+	}
+
+	// only cache small responses in memory
+	if len(res.Body) > 10000000 {
+		return
+	}
+
+	//TODO: cache larger responses and binary data on disk
+
+	// cleanup request-struct for caching
+	req = cleanupRequest(req)
+
+	// insert into cache
+	cache[fmt.Sprintf("%#v", req)] = cacheEntry{
+		Expires: time.Now().Add(time.Duration(30) * time.Minute),
+		Content: res,
+	}
+}
+
+// getCache returns the cached response for a given request
+func getCache(req harp.HTTPRequest) *harp.HTTPResponse {
+	// check if request is cacheable
+	if req.Method != "GET" {
+		return nil
+	}
+
+	// cleanup request-struct for caching
+	req = cleanupRequest(req)
+
+	if entry, ok := cache[fmt.Sprintf("%#v", req)]; ok {
+
+		if entry.Expires.After(time.Now()) {
+			return &entry.Content
+		}
+	}
+	return nil
+}
+
+// cleanupCache removes expired entries from the cache
+func cleanupCache() {
+	for {
+		time.Sleep(1 * time.Minute)
+		for req, entry := range cache {
+			if entry.Expires.Before(time.Now()) {
+				delete(cache, req)
+			}
+		}
+	}
 }
 
 // handleWebSocketConnections handles incoming WebSocket connections
@@ -110,6 +203,34 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func cacheControl(w http.ResponseWriter, r *http.Request) {
+	// set cache control headers
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", time.Now().Format(time.RFC1123))
+}
+
+// checkCache checks if a request should be cached
+func checkCache(r *http.Request) bool {
+	if r.Header.Get("Cache-Control") == "no-cache" {
+		return false
+	}
+
+	if r.Header.Get("Pragma") == "no-cache" {
+		return false
+	}
+
+	if r.Header.Get("If-Modified-Since") != "" {
+		return false
+	}
+
+	if r.Header.Get("If-None-Match") != "" {
+		return false
+	}
+
+	return true
+}
+
 // handleHTTPRequest handles incoming HTTP requests
 func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	// Generate a unique ID for this request
@@ -131,6 +252,30 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	// Copy the HTTP headers
 	for name, values := range r.Header {
 		hr.Headers[name] = values[0]
+	}
+
+	// Check if the request is cached
+	if checkCache(r) {
+		if res := getCache(*hr); res != nil {
+			// Send the cached response to the client
+			w.WriteHeader(200)
+			w.Header().Set("X-Powered-By", "Harp-Cache")
+			for name, value := range res.Headers {
+				w.Header().Set(name, value)
+			}
+
+			// set X-Powered-By header
+			w.Header().Set("X-Powered-By", "Harp-Cache")
+
+			// set cache control headers
+			//cacheControl(w, r)
+
+			// send response body
+			//w.Write([]byte(res.Body))
+			fmt.Fprint(w, res.Body)
+
+			return
+		}
 	}
 
 	// Create a response channel and add it to the pendingResponses map
@@ -173,12 +318,18 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		for name, value := range res.Headers {
 			w.Header().Set(name, value)
 		}
+		w.Header().Set("X-Powered-By", "Harp-Proxy")
 		fmt.Fprint(w, res.Body)
 		mutex.Lock()
 		delete(pendingResponses, id.String())
 		mutex.Unlock()
-	case <-time.After(time.Second * 5):
-		// Timeout after 5 seconds
+
+		// Cache the response
+		if res.Cacheable {
+			insertCache(*hr, *res)
+		}
+	case <-time.After(time.Second * 30):
+		// Timeout after 30 seconds
 		http.Error(w, "Timeout", http.StatusGatewayTimeout)
 		mutex.Lock()
 		delete(pendingResponses, id.String())
@@ -220,6 +371,9 @@ func init() {
 	routes = make(map[string][]harp.Route)
 	pendingResponses = make(map[string]chan *harp.HTTPResponse)
 
+	// cleanup cache periodically
+	go cleanupCache()
+
 	// Check WebSocket Connections in all routes periodically
 	// for availability and remove the ones that are not available
 	go func() {
@@ -240,7 +394,39 @@ func init() {
 	}()
 }
 
+// flag variables
+var port string
+
+/*
+var app string
+var host string
+var cacheDir string
+var cacheTTL string
+var cacheSize string
+var cacheCleanupInterval string
+*/
+
 func main() {
+	// Get Port, App and Host from command line arguments
+	flag.StringVar(&port, "port", "8080", "Port to listen on")
+
+	/*
+		flag.StringVar(&app, "app", "", "Application to proxy to")
+		flag.StringVar(&host, "host", "", "Host to proxy to")
+		flag.StringVar(&cacheDir, "cache", "", "Directory to use for caching")
+		flag.StringVar(&cacheTTL, "cachettl", "1h", "Cache TTL")
+		flag.StringVar(&cacheSize, "cachesize", "100MB", "Cache size")
+		flag.StringVar(&cacheCleanupInterval, "cachecleanupinterval", "1h", "Cache cleanup interval")
+		flag.StringVar(&cacheCleanupMaxAge, "cachecleanupmaxage", "24h", "Cache cleanup max age")
+		flag.StringVar(&cacheCleanupMaxSize, "cachecleanupmaxsize", "100MB", "Cache cleanup max size")
+		flag.StringVar(&cacheCleanupMaxCount, "cachecleanupmaxcount", "1000", "Cache cleanup max count")
+		flag.StringVar(&cacheCleanupMaxSizePerFile, "cachecleanupmaxsizeperfile", "10MB", "Cache cleanup max size per file")
+		flag.StringVar(&cacheCleanupMaxAgePerFile, "cachecleanupmaxageperfile", "1h", "Cache cleanup max age per file")
+	*/
+
+	// Parse command line arguments
+	flag.Parse()
+
 	// Create a new router
 	r := mux.NewRouter()
 
@@ -255,11 +441,11 @@ func main() {
 
 	srv := &http.Server{
 		Handler:      r,
-		Addr:         "127.0.0.1:8080",
-		WriteTimeout: 15 * time.Second,
-		ReadTimeout:  15 * time.Second,
+		Addr:         "127.0.0.1:" + port,
+		WriteTimeout: 30 * time.Second,
+		ReadTimeout:  30 * time.Second,
 	}
 
-	fmt.Println("Listening on 127.0.0.1:8080")
+	fmt.Println("Listening on 127.0.0.1:" + port)
 	srv.ListenAndServe()
 }
