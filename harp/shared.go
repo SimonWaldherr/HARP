@@ -60,5 +60,6 @@ type Status struct {
 	Online       bool          `json:"online"`
 	LastRequest  time.Time     `json:"lastRequest"`
 	LastResponse time.Time     `json:"lastResponse"`
+	Connected    bool          `json:"connected"`
 	AvgLatency   time.Duration `json:"avgLatency"`
 }

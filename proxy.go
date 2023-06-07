@@ -25,7 +25,7 @@ import (
 var routes map[string][]harp.Route
 
 // A map to store pending responses
-var pendingResponses map[string]chan *harp.HTTPResponse = make(map[string]chan *harp.HTTPResponse)
+var pendingResponses map[string]pendingResponse = make(map[string]pendingResponse)
 
 var mutex sync.RWMutex
 
@@ -168,7 +168,7 @@ func handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
 			// Send the response to the correct client
 			mutex.RLock()
 			if responseChannel, ok := pendingResponses[res.ResponseId]; ok {
-				responseChannel <- res
+				responseChannel.Channel <- res
 			}
 			mutex.RUnlock()
 
@@ -282,9 +282,15 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	// Create a response channel and add it to the pendingResponses map
 	// The channel will be used to send the response back to the client
 	// when it is received from the application server via WebSocket
-	responseChannel := make(chan *harp.HTTPResponse, 1)
+
+	//responseChannel := make(chan *harp.HTTPResponse, 1)
+
 	mutex.Lock()
-	pendingResponses[id.String()] = responseChannel
+	pendingResponses[id.String()] = pendingResponse{
+		Channel:   make(chan *harp.HTTPResponse, 1),
+		Timestamp: time.Now(),
+		Path:      r.URL.Path,
+	}
 	mutex.Unlock()
 
 	// Find the correct route and forward the request to the application
@@ -334,6 +340,9 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 			routes[r.URL.Path][0].Status.AvgLatency = (routes[r.URL.Path][0].Status.AvgLatency + res.Latency) / 2
 		}
 
+		// Set Connected in the route status
+		routes[r.URL.Path][0].Status.Connected = true
+
 		mutex.Unlock()
 
 		// Cache the response
@@ -349,18 +358,6 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Generate HTML Table from struct
-func htmlTableFromStruct(s interface{}) string {
-	var table string = "<table>"
-	v := reflect.ValueOf(s)
-	typeOfS := v.Type()
-	for i := 0; i < v.NumField(); i++ {
-		table += fmt.Sprintf("<tr><td>%s</td><td>%v</td></tr>", typeOfS.Field(i).Name, v.Field(i).Interface())
-	}
-	table += "</table>"
-	return table
-}
-
 // handleStatusInfoPage handles the /statusinfo page
 func handleStatusInfoPage(w http.ResponseWriter, r *http.Request) {
 	// Create a table with all routes and their status
@@ -371,17 +368,39 @@ func handleStatusInfoPage(w http.ResponseWriter, r *http.Request) {
 			table += fmt.Sprintf("<tr><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%t</td><td>%s</td><td>%s</td></tr>", route.Name, route.Domain, route.Pattern.String(), route.Port, route.Status.Connected, route.IPorHost, route.Status.AvgLatency)
 		}
 	}
-	mutex.RUnlock()
 	table += "</table>"
 
-	fmt.Fprint(w, table)
+	// Create list of all routes
+	routeList := "<ul>"
+	for _, routex := range routes {
+		for _, route := range routex {
+			routeList += fmt.Sprintf("<li>%s</li>", route.Pattern.String())
+		}
+	}
+
+	routeList += "</ul>"
+
+	// Create a table with all pending responses
+	pending := "<h2>Pending Responses</h2><table><tr><th>Response ID</th><th>Path</th><th>Timestamp</th></tr>"
+	for id, response := range pendingResponses {
+		pending += fmt.Sprintf("<tr><td>%s</td><td>%#v</td><td>%v</td></tr>", id, response.Path, response.Timestamp)
+	}
+
+	// Create the HTML page with the route list, the route status table and the pending responses table
+	page := fmt.Sprintf("<html><head><title>Harp Status Info</title></head><body><h1>Harp Status Info</h1><h2>Routes</h2>%s<h2>Route Status</h2>%s%s</table></body></html>", routeList, table, pending)
+
+	mutex.RUnlock()
+
+	// Send the response
+	fmt.Fprint(w, page)
 }
 
 // init initializes the application
 func init() {
 	// Initialize the routes and pendingResponses maps
 	routes = make(map[string][]harp.Route)
-	pendingResponses = make(map[string]chan *harp.HTTPResponse)
+	pendingResponses = make(map[string]pendingResponse)
+	//pendingResponses = make(map[string]chan *harp.HTTPResponse)
 
 	// cleanup cache periodically
 	go cleanupCache()
@@ -395,7 +414,13 @@ func init() {
 				for i, r := range route {
 					err := r.Conn.WriteMessage(websocket.PingMessage, []byte{})
 					if err != nil {
-						routes[path] = append(routes[path][:i], routes[path][i+1:]...)
+						// if route was already disconnected, remove it
+						if !r.Status.Connected {
+							routes[path] = append(routes[path][:i], routes[path][i+1:]...)
+						}
+
+						// set route status to disconnected
+						r.Status.Connected = false
 					}
 				}
 			}

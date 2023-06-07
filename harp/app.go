@@ -124,7 +124,8 @@ func (s *Server) handleMessage(conn *websocket.Conn, message []byte) error {
 			resp.Timestamp = time.Now()
 
 			// Set the response latency
-			resp.Latency = resp.Timestamp.Sub(req.Timestamp)
+			resp.Latency = time.Since(req.Timestamp)
+			//fmt.Printf("Req-Timestamp: %v, Resp-Timestamp: %v, Latency: %v\n", req.Timestamp, resp.Timestamp, resp.Latency)
 
 			// Detect cachability and set the Cacheable flag
 			if isCacheable(resp, req) {
