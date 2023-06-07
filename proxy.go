@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -42,6 +41,13 @@ var upgrader = websocket.Upgrader{
 type cacheEntry struct {
 	Expires time.Time
 	Content harp.HTTPResponse
+}
+
+// Pending Response Structure
+type pendingResponse struct {
+	Path      string
+	Channel   chan *harp.HTTPResponse
+	Timestamp time.Time
 }
 
 // HTTP Cache
@@ -321,7 +327,7 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Wait for a response and write it back to the client
 	select {
-	case res := <-responseChannel:
+	case res := <-pendingResponses[id.String()].Channel:
 		for name, value := range res.Headers {
 			w.Header().Set(name, value)
 		}
