@@ -247,6 +247,7 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		Headers:    make(map[string]string),
 		Body:       buf.String(),
 		ResponseId: id.String(),
+		Timestamp:  time.Now(),
 	}
 
 	// Copy the HTTP headers
@@ -320,8 +321,19 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("X-Powered-By", "Harp-Proxy")
 		fmt.Fprint(w, res.Body)
+
 		mutex.Lock()
+
+		// Delete the response channel from the pendingResponses map
 		delete(pendingResponses, id.String())
+
+		// Set AvgLatency in the route status
+		if routes[r.URL.Path][0].Status.AvgLatency == 0 {
+			routes[r.URL.Path][0].Status.AvgLatency = res.Latency
+		} else {
+			routes[r.URL.Path][0].Status.AvgLatency = (routes[r.URL.Path][0].Status.AvgLatency + res.Latency) / 2
+		}
+
 		mutex.Unlock()
 
 		// Cache the response
@@ -352,11 +364,11 @@ func htmlTableFromStruct(s interface{}) string {
 // handleStatusInfoPage handles the /statusinfo page
 func handleStatusInfoPage(w http.ResponseWriter, r *http.Request) {
 	// Create a table with all routes and their status
-	table := "<table><tr><th>App</th><th>Domain</th><th>Path</th><th>Port</th><th>Connected</th><th>Host</th></tr>"
+	table := "<table><tr><th>App</th><th>Domain</th><th>Path</th><th>Port</th><th>Connected</th><th>Host</th><th>Avg. Latency</th></tr>"
 	mutex.RLock()
 	for _, routex := range routes {
 		for _, route := range routex {
-			table += fmt.Sprintf("<tr><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%t</td><td>%s</td></tr>", route.Name, route.Domain, route.Pattern.String(), route.Port, true, route.IPorHost)
+			table += fmt.Sprintf("<tr><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%t</td><td>%s</td><td>%s</td></tr>", route.Name, route.Domain, route.Pattern.String(), route.Port, route.Status.Connected, route.IPorHost, route.Status.AvgLatency)
 		}
 	}
 	mutex.RUnlock()

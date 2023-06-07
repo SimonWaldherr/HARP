@@ -136,6 +136,9 @@ func (s *Server) handleMessage(conn *websocket.Conn, message []byte) error {
 			s.routes[i].Status.LastRequest = req.Timestamp
 			s.routes[i].Status.LastResponse = resp.Timestamp
 
+			// Set the avg latency
+			s.routes[i].Status.AvgLatency = (s.routes[i].Status.AvgLatency + resp.Latency) / 2
+
 			// Convert the HTTPResponse struct into a JSON string
 			respJSON, err := json.Marshal(resp)
 			if err != nil {

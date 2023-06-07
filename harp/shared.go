@@ -57,7 +57,8 @@ type Registration struct {
 
 // Status is the status of a route
 type Status struct {
-	Online       bool      `json:"online"`
-	LastRequest  time.Time `json:"lastRequest"`
-	LastResponse time.Time `json:"lastResponse"`
+	Online       bool          `json:"online"`
+	LastRequest  time.Time     `json:"lastRequest"`
+	LastResponse time.Time     `json:"lastResponse"`
+	AvgLatency   time.Duration `json:"avgLatency"`
 }
