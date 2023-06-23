@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/SimonWaldherr/HARP/harp"
+	//harp "../harp"
 )
 
 // Some very complex business logic

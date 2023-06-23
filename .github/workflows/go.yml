@@ -1,0 +1,25 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.20'
+
+      - name: Build Proxy
+        run: go build -v -ldflags "-w" -o harpProxy github.com/SimonWaldherr/HARP/ 
+        
+      - name: Build Demo Client
+        run: go build -v -ldflags "-w" -o harpDemoClient github.com/SimonWaldherr/HARP/demo_applications/ 
