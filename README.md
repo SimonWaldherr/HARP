@@ -1,6 +1,7 @@
 # HARP
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/simonwaldherr/harp)](https://goreportcard.com/report/github.com/simonwaldherr/harp) 
+[![Build](https://github.com/SimonWaldherr/HARP/actions/workflows/go.yml/badge.svg?event=push)](https://github.com/SimonWaldherr/HARP/actions/workflows/go.yml) 
 [![GoDoc](https://pkg.go.dev/badge/github.com/SimonWaldherr/HARP)](https://pkg.go.dev/github.com/SimonWaldherr/HARP) 
 [![GPL License](https://img.shields.io/badge/license-GPL-blue)](https://github.com/SimonWaldherr/HARP/blob/main/LICENSE)  
 
