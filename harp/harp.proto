@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package harp;
+
+option go_package = "github.com/SimonWaldherr/HARP2/harp";
+
+// Represents an HTTP request forwarded from the proxy to a backend.
+message HTTPRequest {
+  string method = 1;
+  string url = 2;
+  map<string, string> headers = 3;
+  string body = 4;
+  string requestId = 5;
+  int64 timestamp = 6; // Unix nano timestamp
+}
+
+// Represents an HTTP response from the backend to the proxy.
+message HTTPResponse {
+  int32 status = 1;
+  map<string, string> headers = 2;
+  string body = 3;
+  string requestId = 4;
+  int64 timestamp = 5;
+  bool cacheable = 6;
+  int64 latency = 7; // in nanoseconds
+}
+
+// Registration info sent by the backend.
+message Registration {
+  string name = 1;
+  string domain = 2;
+  string key = 3;
+  repeated Route routes = 4;
+}
+
+// A route specification.
+message Route {
+  string name = 1;
+  string path = 2;
+  int32 port = 3;
+  string domain = 4;
+}
+
+// Message sent from the backend (client) to the proxy.
+message ClientMessage {
+  oneof payload {
+    Registration registration = 1;
+    HTTPResponse httpResponse = 2;
+  }
+}
+
+// Message sent from the proxy (server) to the backend.
+message ServerMessage {
+  HTTPRequest httpRequest = 1;
+}
+
+// Bidirectional streaming RPC.
+service HarpService {
+  rpc Proxy(stream ClientMessage) returns (stream ServerMessage);
+}
