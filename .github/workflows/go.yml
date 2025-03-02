@@ -22,4 +22,4 @@ jobs:
         run: go build -v -ldflags "-w" -o harpProxy github.com/SimonWaldherr/HARP/ 
         
       - name: Build Demo Client
-        run: go build -v -ldflags "-w" -o harpDemoClient github.com/SimonWaldherr/HARP/demo_applications/ 
+        run: go build -v -ldflags "-w" -o harpDemoClient github.com/SimonWaldherr/HARP/demos/simple-go/ 
