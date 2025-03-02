@@ -1,6 +1,6 @@
-module github.com/SimonWaldherr/HARP/demo_application
+module github.com/SimonWaldherr/HARP/demos/static-wrapper-go
 
-go 1.24.0
+go 1.23
 
 replace github.com/SimonWaldherr/HARP/harpserver => ../../harpserver
 

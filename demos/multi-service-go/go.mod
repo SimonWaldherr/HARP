@@ -1,4 +1,4 @@
-module github.com/SimonWaldherr/HARP/demo_application
+module github.com/SimonWaldherr/HARP/demos/multi-service-go
 
 go 1.23
 

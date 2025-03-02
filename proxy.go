@@ -1,4 +1,4 @@
-// proxy.go
+// Description: A simple HTTP reverse proxy that forwards requests to registered backends.
 package main
 
 import (
