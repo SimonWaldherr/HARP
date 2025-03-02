@@ -1,0 +1,22 @@
+{
+  "grpcPort": ":50051",
+  "httpPort": ":8080",
+  "http3Port": ":8443",
+  "enableGRPCTLS": false,
+  "grpcTLSCert": "",
+  "grpcTLSKey": "",
+  "enableHTTPS": false,
+  "httpsCert": "",
+  "httpsKey": "",
+  "enableHTTP3": false,
+  "enableCache": true,
+  "cacheType": "memory",
+  "diskCacheDir": "./cache",
+  "cacheTTL": "30m",
+  "allowedRegistration": [
+    { "route": "/foobar/.*$", "key": "secret1" },
+    { "route": "/lorem/.*$",  "key": "ipsum-key" },
+    { "route": "/.*$",       "key": "master-key" }
+  ],
+  "logLevel": "DEBUG"
+}

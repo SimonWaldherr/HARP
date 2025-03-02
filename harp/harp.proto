@@ -1,17 +1,16 @@
+// harp/harp.proto
 syntax = "proto3";
-
 package harp;
-
 option go_package = "github.com/SimonWaldherr/HARP2/harp";
 
-// Represents an HTTP request forwarded from the proxy to a backend.
+// Represents an HTTP request forwarded from the proxy to the backend.
 message HTTPRequest {
   string method = 1;
   string url = 2;
   map<string, string> headers = 3;
   string body = 4;
   string requestId = 5;
-  int64 timestamp = 6; // Unix nano timestamp
+  int64 timestamp = 6;
 }
 
 // Represents an HTTP response from the backend to the proxy.
@@ -22,7 +21,7 @@ message HTTPResponse {
   string requestId = 4;
   int64 timestamp = 5;
   bool cacheable = 6;
-  int64 latency = 7; // in nanoseconds
+  int64 latency = 7;
 }
 
 // Registration info sent by the backend.

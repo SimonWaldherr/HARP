@@ -4,7 +4,7 @@
 [![Build Status](https://github.com/SimonWaldherr/HARP/actions/workflows/go.yml/badge.svg)](https://github.com/SimonWaldherr/HARP/actions)
 [![License: GPL](https://img.shields.io/badge/license-GPL-blue.svg)](./LICENSE)
 
-_HARP (HTTP Autoregister Reverse Proxy)_ is a dynamic reverse proxy designed for modern microservice architectures. In this gRPC edition, backend services register themselves over a bidirectional gRPC stream, allowing them to expose HTTP endpoints without being directly reachable from the public network. Instead, HARP acts as a gateway that forwards client HTTP requests to registered backends and relays their responses back to the client.
+HARP is a dynamic reverse proxy designed to expose backend applications (even those hidden behind NAT or firewalls) to the Internet without directly exposing them. Backends connect via gRPC, register their HTTP endpoints, and receive forwarded HTTP requests. The proxy now supports a structured configuration for per‑route authentication and includes a helper to easily wrap existing web‑applications.
 
 ---
 
@@ -16,41 +16,44 @@ _HARP (HTTP Autoregister Reverse Proxy)_ is a dynamic reverse proxy designed for
 - [Sequence Diagram](#sequence-diagram)
 - [Installation & Usage](#installation--usage)
 - [Configuration](#configuration)
-- [Additional Features & Improvements](#additional-features--improvements)
+- [Examples](#examples)
+- [Using the Web Handler Wrapper](#using-the-web-handler-wrapper)
+- [Additional Features](#additional-features)
 - [License](#license)
 
 ---
 
 ## Overview
 
-HARP leverages gRPC’s bidirectional streaming to allow backend services to dynamically register routes and receive HTTP requests forwarded by the proxy. The proxy itself runs both a gRPC server (for backend registration and communication) and an HTTP server (for handling client requests). It also supports multiple protocols: plain HTTP, HTTPS, and HTTP/3 (QUIC). In addition, it features configurable caching options (in‑memory or disk‑based) to reduce backend load.
+HARP allows your internal servers (or devices like Raspberry Pis) to securely expose HTTP endpoints by connecting to a publicly hosted proxy. The backends register via gRPC using a per‑route authentication mechanism defined in the configuration. Existing web‑applications can be integrated easily using the provided handler wrapper.
 
 ---
 
 ## Architecture
 
-HARP is composed of two major parts:
+- **Proxy Server:**  
+  Runs both a gRPC server (for backend registration and messaging) and an HTTP/HTTPS/HTTP3 server (for client requests).  
+  - Reads configuration from `config.json`.
+  - Uses a structured list of allowed registrations to enforce per‑route authentication.
+  - Implements caching (in‑memory or disk‑based).
 
-1. **Backend Registration & Processing (gRPC Client)**
-   - **Backend Application:** Implements local HTTP handlers to process requests.
-   - **HARP Client Library:** Connects to the HARP proxy via gRPC, sends a registration message (with route information), and waits on a bidirectional stream for forwarded HTTP requests.
-
-2. **HARP Proxy (gRPC Server & HTTP Server)**
-   - **gRPC Server:** Accepts bidirectional streaming connections from backend applications, maintains an internal registry of routes, and handles responses.
-   - **HTTP Server:** Accepts client HTTP requests, finds a matching backend (by inspecting route patterns), forwards requests via the gRPC stream, and returns the backend’s response to the client.
+- **Backend Applications:**  
+  Connect to the proxy via gRPC, register their available routes, and handle forwarded HTTP requests.  
+  A helper is provided so that existing net/http–based web applications can be wrapped with minimal changes.
 
 ---
 
 ## How It Works
 
 1. **Backend Registration:**  
-   A backend service connects to the HARP proxy’s gRPC server and sends a registration message with its available routes (domain and path patterns).
+   A backend connects to the proxy’s gRPC server and sends a registration message with its available routes and a key.  
+   The proxy checks each route against the allowed registrations defined in the configuration file. Only routes whose path matches a configured regex and whose key is correct are accepted.
 
 2. **Request Forwarding:**  
-   When a client sends an HTTP request, the proxy checks its cache (if enabled) and then matches the request URL to a registered backend route. The proxy forwards the request as a gRPC message.
+   When the proxy receives an HTTP request, it looks up a matching registered route and forwards the request via gRPC.
 
-3. **Response Handling:**  
-   The backend processes the request and sends an HTTP response via the same gRPC stream. The proxy relays this response back to the client and caches it if appropriate.
+3. **Response Relay & Caching:**  
+   The backend processes the request and returns a response via gRPC, which the proxy relays to the client. Responses may also be cached.
 
 ---
 
@@ -59,26 +62,26 @@ HARP is composed of two major parts:
 ```mermaid
 sequenceDiagram
     participant Client as Client
-    participant HARP as HARP Proxy
+    participant Proxy as HARP Proxy
     participant GRPC as gRPC Server
     participant Backend as Backend Service
-    participant Cache as In-Memory / Disk Cache
+    participant Cache as Cache Store
 
-    Client->>HARP: HTTP Request (domain/path)
-    HARP->>Cache: Check for Cached Response
-    alt Cached Response Found
-        Cache-->>HARP: Cached HTTP Response
-        HARP->>Client: Return Cached HTTP Response
-    else No Cached Response
-        HARP->>GRPC: Forward HTTP Request as gRPC message
+    Client->>Proxy: HTTP Request (domain/path)
+    Proxy->>Cache: Check for Cached Response
+    alt Cache Hit
+        Cache-->>Proxy: Cached Response
+        Proxy->>Client: Return Cached Response
+    else Cache Miss
+        Proxy->>GRPC: Forward HTTP Request (gRPC message)
         GRPC->>Backend: Dispatch request via bidirectional stream
-        Backend->>GRPC: Process request & reply (HTTPResponse)
-        GRPC->>HARP: Return HTTPResponse over gRPC stream
-        HARP->>Cache: Insert response (if cacheable)
-        HARP->>Client: Return HTTPResponse
+        Backend->>GRPC: Process request & return HTTP Response
+        GRPC->>Proxy: Return HTTP Response over gRPC stream
+        Proxy->>Cache: Store response (if cacheable)
+        Proxy->>Client: Relay HTTP Response
     end
 
-    note over Backend,HARP: Backend registration occurs via gRPC on startup
+    note over Backend,Proxy: Backend registration occurs on startup<br/>with per‑route authentication.
 ```
 
 ---
@@ -88,97 +91,83 @@ sequenceDiagram
 ### Prerequisites
 
 - [Go](https://golang.org) (v1.16 or later)
-- [protoc](https://grpc.io/docs/protoc-installation/) (Protocol Buffers compiler)
-- [gRPC-Go](https://github.com/grpc/grpc-go) and related plugins
+- [protoc](https://grpc.io/docs/protoc-installation/) (for regenerating proto code if needed)
+- (Optional) QUIC-Go for HTTP/3 support
 
-### Building the Project
+### Build & Run
 
-1. **Generate gRPC Code:**  
-   In the project root, run:
+1. **Configuration:**  
+   Adjust the settings in `config.json` as required. Note the new `allowedRegistration` section which defines allowed route regexes and their corresponding keys.
+
+2. **Build the Proxy:**  
    ```bash
-   make proto
-   ```
-2. **Build the Proxy and Backend:**
-   ```bash
-   make build
+   go build -o bin/harp-proxy proxy.go
    ```
 
-### Running the System
-
-1. **Start the Proxy:**  
+3. **Run the Proxy:**  
    ```bash
-   make run-proxy
+   ./bin/harp-proxy -config config.json
    ```
-   This starts the gRPC server on the default port (`:50051`) and the HTTP server on (`:8080`). Use command‑line flags to enable HTTPS or HTTP/3 if desired.
 
-2. **Start a Demo Backend:**  
-   In a separate terminal, run:
+4. **Run a Backend Example:**  
+   For example, in `demos/simple-go`:
    ```bash
-   make run-backend
-   ```
-   The backend connects to the proxy, registers its routes, and listens for requests.
-
-3. **Test the Setup:**  
-   For example:
-   ```bash
-   curl http://localhost:8080/test
+   go run app.go -proxy localhost:50051
    ```
 
 ---
 
 ## Configuration
 
-HARP is highly configurable via command‑line flags. Here are some key options:
+The `config.json` file controls the proxy behavior. Key settings include:
 
-### Proxy Configuration
+- **Ports & TLS:**  
+  - `grpcPort`, `httpPort`, `http3Port`
+  - TLS settings for gRPC and HTTPS/HTTP3
 
-- **gRPC Server Settings:**
-  - `-grpc-port`: gRPC server address (default: `:50051`)
-  - `-grpc-tls`: Enable TLS for gRPC
-  - `-grpc-cert` and `-grpc-key`: Paths to TLS certificate and key for gRPC
+- **Caching:**  
+  - `enableCache`, `cacheType` (`memory` or `disk`), `cacheTTL`
 
-- **HTTP Server Settings:**
-  - `-http-port`: HTTP server address (default: `:8080`)
-  - `-https`: Enable HTTPS
-  - `-https-cert` and `-https-key`: TLS certificate and key for HTTPS
+- **Allowed Registrations:**  
+  A list of objects defining allowed registration rules. For example:
+  ```json
+  "allowedRegistration": [
+    { "route": "/foobar/.*$", "key": "secret1" },
+    { "route": "/lorem/.*$",  "key": "ipsum-key" },
+    { "route": "/.*$",       "key": "master-key" }
+  ]
+  ```
+  When a backend registers, each of its routes is checked against these rules. Only routes matching a rule with the correct key are accepted.
 
-- **HTTP/3 / QUIC:**
-  - `-http3`: Enable HTTP/3 (requires HTTPS)
-  - `-http3-port`: HTTP/3 server address (default: `:8443`)
+- **Logging:**  
+  Set via `logLevel` (e.g. DEBUG, INFO).
 
-- **Caching:**
-  - `-enable-cache`: Enable response caching (default: true)
-  - `-cache-type`: Cache type: `memory` or `disk` (default: `memory`)
-  - `-disk-cache-dir`: Directory for disk cache (if using disk cache)
-  - `-cache-ttl`: Cache expiration time (default: 30m)
+---
 
-### Logging & Miscellaneous
+## Examples
 
-- `-log-level`: Set log verbosity (`DEBUG`, `INFO`, etc.)
+The **demos/** folder includes several backend examples:
+
+1. **Simple Go Application (demos/simple-go):**  
+   Registers a `/test` route and responds with a greeting.
+
+2. **Multi‑Service Application (demos/multi-service-go):**  
+   Registers multiple routes (e.g. math operations, hello, joke) and dispatches based on URL.
+
+3. **Wrapper Example (demos/static-wrapper-go):**  
+   Uses the HARP handler wrapper to directly integrate an existing net/http–based web application.
+
+4. **complex-harp-server:**  
+   A more complex example with multiple routes.
+
+---
+
+## Using the Web Handler Wrapper
+
+The new helper in `harp/handler.go` (the `BackendServer` type and its `ListenAndServeHarp()` method) lets you wrap an existing `http.Handler` so that your web application can be exposed via HARP with minimal changes. 
 
 ---
 
 ## License
 
-HARP is released under the [GPL License](./LICENSE).
-
----
-
-Contributions, issues, and feature requests are welcome. Enjoy building dynamic, secure, and scalable microservice systems with HARP!
-
-
-## Final Notes
-
-- **Generate gRPC Code:**  
-  Run `make proto` to generate the Go code from `harp.proto`.
-
-- **Build the Project:**  
-  Use `make build` to compile both the proxy and demo backend.
-
-- **Run the Services:**  
-  Start the proxy with `make run-proxy` and the demo backend with `make run-backend`.
-
-- **Configure Protocols & Caching:**  
-  Use command‑line flags (or extend the flag parsing) to enable HTTPS, HTTP/3, or change cache type/settings.
-
-This complete set of files provides a fully functional, configurable, and extensible HARP proxy project using gRPC for dynamic backend registration and HTTP request forwarding. Enjoy!
+HARP is released under the GPL License. See [LICENSE](./LICENSE) for details.

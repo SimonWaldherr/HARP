@@ -1,4 +1,4 @@
-// demo_applications/app.go
+// demos/simple-go/app.go
 package main
 
 import (
@@ -12,15 +12,13 @@ import (
 	"google.golang.org/grpc"
 )
 
-var (
-	proxyAddress = flag.String("proxy", "localhost:50051", "Address of the HARP proxy")
-)
+var proxyAddr = flag.String("proxy", "localhost:50051", "Address of the HARP proxy")
 
 func main() {
 	flag.Parse()
 
-	// Connect to the HARP proxy's gRPC server.
-	conn, err := grpc.Dial(*proxyAddress, grpc.WithInsecure())
+	// Connect to the proxy.
+	conn, err := grpc.Dial(*proxyAddr, grpc.WithInsecure())
 	if err != nil {
 		log.Fatalf("Failed to connect to proxy: %v", err)
 	}
@@ -33,11 +31,11 @@ func main() {
 		log.Fatalf("Failed to create gRPC stream: %v", err)
 	}
 
-	// Send registration message.
+	// Register a simple route "/test" using the master key.
 	reg := &pb.Registration{
-		Name:   "DemoBackend",
+		Name:   "SimpleBackend",
 		Domain: ".*",
-		Key:    "123",
+		Key:    "master-key",
 		Routes: []*pb.Route{
 			{
 				Name:   "TestRoute",
@@ -47,47 +45,39 @@ func main() {
 			},
 		},
 	}
-	regMsg := &pb.ClientMessage{
-		Payload: &pb.ClientMessage_Registration{
-			Registration: reg,
-		},
-	}
-	if err := stream.Send(regMsg); err != nil {
+	if err := stream.Send(&pb.ClientMessage{
+		Payload: &pb.ClientMessage_Registration{Registration: reg},
+	}); err != nil {
 		log.Fatalf("Failed to send registration: %v", err)
 	}
-	log.Println("Registration sent. Waiting for HTTP requests...")
+	log.Println("SimpleBackend registered. Waiting for requests...")
 
-	// Listen for HTTP requests from the proxy.
+	// Listen for incoming HTTP requests.
 	for {
-		serverMsg, err := stream.Recv()
+		msg, err := stream.Recv()
 		if err != nil {
 			log.Fatalf("Error receiving from proxy: %v", err)
 		}
-		httpReq := serverMsg.GetHttpRequest()
-		if httpReq == nil {
+		req := msg.GetHttpRequest()
+		if req == nil {
 			continue
 		}
-		log.Printf("Received HTTP request: %s %s", httpReq.Method, httpReq.Url)
-
-		// Simulate processing delay.
-		time.Sleep(2 * time.Second)
-
-		// Create an HTTP response.
-		httpResp := &pb.HTTPResponse{
+		log.Printf("Received request: %s %s", req.Method, req.Url)
+		// Simulate processing.
+		time.Sleep(1 * time.Second)
+		response := fmt.Sprintf("Hello from SimpleBackend! You requested %s", req.Url)
+		resp := &pb.HTTPResponse{
 			Status:    200,
 			Headers:   map[string]string{"Content-Type": "text/plain"},
-			Body:      fmt.Sprintf("Hello from DemoBackend! Processed %s", httpReq.Url),
-			RequestId: httpReq.RequestId,
+			Body:      response,
+			RequestId: req.RequestId,
 			Timestamp: time.Now().UnixNano(),
 			Cacheable: true,
-			Latency:   int64(2 * time.Second),
+			Latency:   int64(1 * time.Second),
 		}
-		respMsg := &pb.ClientMessage{
-			Payload: &pb.ClientMessage_HttpResponse{
-				HttpResponse: httpResp,
-			},
-		}
-		if err := stream.Send(respMsg); err != nil {
+		if err := stream.Send(&pb.ClientMessage{
+			Payload: &pb.ClientMessage_HttpResponse{HttpResponse: resp},
+		}); err != nil {
 			log.Printf("Error sending response: %v", err)
 		}
 	}

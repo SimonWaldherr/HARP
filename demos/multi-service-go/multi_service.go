@@ -1,3 +1,4 @@
+// demos/multi-service-go/multi_service.go
 package main
 
 import (
@@ -16,22 +17,12 @@ import (
 	"google.golang.org/grpc"
 )
 
-var (
-	proxyAddress = flag.String("proxy", "simonwaldherr.de:50051", "Address of the HARP proxy")
-)
-
-// Predefined jokes for the /joke route
-var jokes = []string{
-	"Why don't programmers like nature? It has too many bugs.",
-	"Why do Java developers wear glasses? Because they don't C#.",
-	"Why was the developer unhappy at their job? They wanted arrays.",
-}
+var proxyAddr = flag.String("proxy", "localhost:50051", "Address of the HARP proxy")
 
 func main() {
 	flag.Parse()
 
-	// Connect to the HARP proxy's gRPC server.
-	conn, err := grpc.Dial(*proxyAddress, grpc.WithInsecure())
+	conn, err := grpc.Dial(*proxyAddr, grpc.WithInsecure())
 	if err != nil {
 		log.Fatalf("Failed to connect to proxy: %v", err)
 	}
@@ -44,11 +35,11 @@ func main() {
 		log.Fatalf("Failed to create gRPC stream: %v", err)
 	}
 
-	// Register multiple routes
+	// Register multiple routes using the master key.
 	reg := &pb.Registration{
-		Name:   "MultiService",
+		Name:   "MultiServiceBackend",
 		Domain: ".*",
-		Key:    "123",
+		Key:    "master-key",
 		Routes: []*pb.Route{
 			{Name: "Add", Path: "/math/add", Port: 8083, Domain: ".*"},
 			{Name: "Multiply", Path: "/math/multiply", Port: 8083, Domain: ".*"},
@@ -56,104 +47,91 @@ func main() {
 			{Name: "Joke", Path: "/joke", Port: 8083, Domain: ".*"},
 		},
 	}
-	regMsg := &pb.ClientMessage{
-		Payload: &pb.ClientMessage_Registration{
-			Registration: reg,
-		},
+	if err := stream.Send(&pb.ClientMessage{
+		Payload: &pb.ClientMessage_Registration{Registration: reg},
+	}); err != nil {
+		log.Fatalf("Registration failed: %v", err)
 	}
-	if err := stream.Send(regMsg); err != nil {
-		log.Fatalf("Failed to send registration: %v", err)
-	}
-	log.Println("MultiService registered. Waiting for HTTP requests...")
+	log.Println("MultiServiceBackend registered. Waiting for requests...")
 
-	// Listen for HTTP requests from the proxy.
 	for {
-		serverMsg, err := stream.Recv()
+		msg, err := stream.Recv()
 		if err != nil {
 			log.Fatalf("Error receiving from proxy: %v", err)
 		}
-		httpReq := serverMsg.GetHttpRequest()
-		if httpReq == nil {
+		req := msg.GetHttpRequest()
+		if req == nil {
 			continue
 		}
-		log.Printf("Received HTTP request: %s %s", httpReq.Method, httpReq.Url)
+		log.Printf("Received request: %s %s", req.Method, req.Url)
 
-		// Handle different routes
 		var response string
 		var contentType = "text/plain"
-
 		switch {
-		case strings.HasPrefix(httpReq.Url, "/math/add"):
-			response, contentType = handleMath(httpReq, "add")
-		case strings.HasPrefix(httpReq.Url, "/math/multiply"):
-			response, contentType = handleMath(httpReq, "multiply")
-		case strings.HasPrefix(httpReq.Url, "/hello/"):
-			response, contentType = handleHello(httpReq)
-		case httpReq.Url == "/joke":
+		case strings.HasPrefix(req.Url, "/math/add"):
+			response, contentType = handleMath(req, "add")
+		case strings.HasPrefix(req.Url, "/math/multiply"):
+			response, contentType = handleMath(req, "multiply")
+		case strings.HasPrefix(req.Url, "/hello/"):
+			response, contentType = handleHello(req)
+		case req.Url == "/joke":
 			response, contentType = handleJoke()
 		default:
 			response = "404 - Not Found"
 		}
-
-		// Send the response
-		httpResp := &pb.HTTPResponse{
+		resp := &pb.HTTPResponse{
 			Status:    200,
 			Headers:   map[string]string{"Content-Type": contentType},
 			Body:      response,
-			RequestId: httpReq.RequestId,
+			RequestId: req.RequestId,
 			Timestamp: time.Now().UnixNano(),
 			Cacheable: false,
 			Latency:   int64(500 * time.Millisecond),
 		}
-		respMsg := &pb.ClientMessage{
-			Payload: &pb.ClientMessage_HttpResponse{
-				HttpResponse: httpResp,
-			},
-		}
-		if err := stream.Send(respMsg); err != nil {
+		if err := stream.Send(&pb.ClientMessage{
+			Payload: &pb.ClientMessage_HttpResponse{HttpResponse: resp},
+		}); err != nil {
 			log.Printf("Error sending response: %v", err)
 		}
 	}
 }
 
-// Handle math operations (add, multiply)
-func handleMath(req *pb.HTTPRequest, operation string) (string, string) {
+func handleMath(req *pb.HTTPRequest, op string) (string, string) {
 	parsedURL, _ := url.Parse(req.Url)
 	params := parsedURL.Query()
 	a, _ := strconv.Atoi(params.Get("a"))
 	b, _ := strconv.Atoi(params.Get("b"))
-
 	var result int
-	switch operation {
-	case "add":
+	if op == "add" {
 		result = a + b
-	case "multiply":
+	} else {
 		result = a * b
 	}
-
 	respData := map[string]interface{}{
-		"operation": operation,
+		"operation": op,
 		"a":         a,
 		"b":         b,
 		"result":    result,
 	}
-	respJSON, _ := json.Marshal(respData)
-	return string(respJSON), "application/json"
+	data, _ := json.Marshal(respData)
+	return string(data), "application/json"
 }
 
-// Handle /hello/{name} requests
 func handleHello(req *pb.HTTPRequest) (string, string) {
 	parts := strings.Split(strings.TrimPrefix(req.Url, "/hello/"), "/")
 	name := "Guest"
 	if len(parts) > 0 && parts[0] != "" {
 		name = parts[0]
 	}
-	return fmt.Sprintf("Hello, %s! Welcome to MultiService.", name), "text/plain"
+	return fmt.Sprintf("Hello, %s! Welcome to MultiServiceBackend.", name), "text/plain"
 }
 
-// Handle /joke requests
 func handleJoke() (string, string) {
+	jokes := []string{
+		"Why don't programmers like nature? It has too many bugs.",
+		"Why do Java developers wear glasses? Because they don't C#.",
+		"Why was the developer unhappy at their job? They wanted arrays.",
+	}
 	rand.Seed(time.Now().UnixNano())
-	joke := jokes[rand.Intn(len(jokes))]
-	return joke, "text/plain"
+	return jokes[rand.Intn(len(jokes))], "text/plain"
 }
