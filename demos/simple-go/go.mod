@@ -1,6 +1,6 @@
 module github.com/SimonWaldherr/HARP/demo_application
 
-go 1.23.0
+go 1.23
 
 replace github.com/SimonWaldherr/HARP/harp => ../../harp
 

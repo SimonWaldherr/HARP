@@ -1,6 +1,6 @@
 module github.com/SimonWaldherr/HARP/harp
 
-go 1.23.0
+go 1.23
 
 require (
 	google.golang.org/grpc v1.70.0
