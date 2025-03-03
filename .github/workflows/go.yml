@@ -31,7 +31,7 @@ jobs:
         run: go mod tidy
 
       - name: Build Proxy
-        run: go build -v -ldflags "-w" -o harpProxy ./harp
+        run: go build -v -ldflags "-w" -o harpProxy .
 
       - name: Build Demo Client
         run: go build -v -ldflags "-w" -o harpDemoClient ./demos/simple-go
