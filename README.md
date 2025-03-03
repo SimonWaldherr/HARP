@@ -1,7 +1,7 @@
 # HARP – HTTP Autoregister Reverse Proxy (gRPC Edition)
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/SimonWaldherr/HARP)](https://goreportcard.com/report/github.com/SimonWaldherr/HARP)
-[![Build Status](https://github.com/SimonWaldherr/HARP/actions/workflows/go.yml/badge.svg)](https://github.com/SimonWaldherr/HARP/actions)
+[![Build](https://github.com/SimonWaldherr/HARP/actions/workflows/go.yml/badge.svg?branch=main)](https://github.com/SimonWaldherr/HARP/actions/workflows/go.yml)
 [![License: GPL](https://img.shields.io/badge/license-GPL-blue.svg)](./LICENSE)
 
 HARP is a dynamic reverse proxy designed to expose backend applications (even those hidden behind NAT or firewalls) to the Internet without directly exposing them. Backends connect via gRPC, register their HTTP endpoints, and receive forwarded HTTP requests. The proxy now supports a structured configuration for per‑route authentication and includes a helper to easily wrap existing web‑applications.
@@ -18,7 +18,6 @@ HARP is a dynamic reverse proxy designed to expose backend applications (even th
 - [Configuration](#configuration)
 - [Examples](#examples)
 - [Using the Web Handler Wrapper](#using-the-web-handler-wrapper)
-- [Additional Features](#additional-features)
 - [License](#license)
 
 ---
