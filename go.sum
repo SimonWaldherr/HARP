@@ -1,5 +1,7 @@
-github.com/SimonWaldherr/HARP/harp v1.1.5 h1:jW2rq0eVk7iuyJ1u5IeXJ+v0h8WSefcVs3UkpQt5a1E=
-github.com/SimonWaldherr/HARP/harp v1.1.5/go.mod h1:4G59UbA9mmwuoDPl/TD45MPiikaF8J/sLwgrsDmaHdI=
+github.com/SimonWaldherr/HARP/harp v1.1.6 h1:sR+cPxzILSl0bdVDU6VzD/RdBbBhoSEohNiBicnyGr0=
+github.com/SimonWaldherr/HARP/harp v1.1.6/go.mod h1:4G59UbA9mmwuoDPl/TD45MPiikaF8J/sLwgrsDmaHdI=
+github.com/SimonWaldherr/HARP/harpserver v1.1.5 h1:WWPcgKmmjioUA1NlBJxv2rdgMhwuc4NRG5wyEBejGHE=
+github.com/SimonWaldherr/HARP/harpserver v1.1.5/go.mod h1:ti3lCI6cvL0U9NhwEViwytav9U918/v5LOtBXlCzta8=
 github.com/chzyer/logex v1.1.10/go.mod h1:+Ywpsq7O8HXn0nuIou7OrIPyXbp3wmkHB+jjWRnGsAI=
 github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e/go.mod h1:nSuG5e5PlCu98SY8svDHJxuZscDgtXS6KTTbou5AhLI=
 github.com/chzyer/test v0.0.0-20180213035817-a1ea475d72b1/go.mod h1:Q3SI9o4m/ZMnBNeIyt5eFwwo7qiLfzFZmjNmxjkiQlU=
@@ -20,6 +22,8 @@ github.com/google/pprof v0.0.0-20210407192527-94a9f03dee38 h1:yAJXTCF9TqKcTiHJAE
 github.com/google/pprof v0.0.0-20210407192527-94a9f03dee38/go.mod h1:kpwsk12EmLew5upagYY7GY0pfYCcupk39gWOCRROcvE=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/gorilla/mux v1.8.1 h1:TuBL49tXwgrFYWhqrNgrUNEY92u81SPhu7sTdzQEiWY=
+github.com/gorilla/mux v1.8.1/go.mod h1:AKf9I4AEqPTmMytcMc0KkNouC66V3BtZ4qD5fmWSiMQ=
 github.com/ianlancetaylor/demangle v0.0.0-20200824232613-28f6c0f3b639/go.mod h1:aSSvb/t6k1mPoxDqO4vJh6VOCGPwU4O0C2/Eqndh1Sc=
 github.com/onsi/ginkgo/v2 v2.9.5 h1:+6Hr4uxzP4XIUyAkg61dWBw8lb/gc4/X5luuxN/EC+Q=
 github.com/onsi/ginkgo/v2 v2.9.5/go.mod h1:tvAoo1QUJwNEU2ITftXTpR7R1RbCzoZUOs3RonqW57k=

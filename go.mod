@@ -4,7 +4,9 @@ go 1.23
 
 require (
 	github.com/SimonWaldherr/HARP/harp v1.1.6
+	github.com/SimonWaldherr/HARP/harpserver v1.1.5
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/mux v1.8.1
 	github.com/quic-go/quic-go v0.49.0
 	google.golang.org/grpc v1.70.0
 )

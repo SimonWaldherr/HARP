@@ -3,7 +3,7 @@ module github.com/SimonWaldherr/HARP/harpserver
 go 1.23
 
 require (
-	github.com/SimonWaldherr/HARP/harp v1.1.6
+	github.com/SimonWaldherr/HARP/harp v1.1.7
 	google.golang.org/grpc v1.70.0
 )
 
