@@ -2,10 +2,8 @@ module github.com/SimonWaldherr/HARP/harpserver
 
 go 1.23
 
-replace github.com/SimonWaldherr/HARP/harp => ../harp
-
 require (
-	github.com/SimonWaldherr/HARP/harp v0.0.0-00010101000000-000000000000
+	github.com/SimonWaldherr/HARP/harp v1.1.4
 	google.golang.org/grpc v1.70.0
 )
 

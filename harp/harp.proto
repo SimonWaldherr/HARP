@@ -1,7 +1,7 @@
 // harp/harp.proto
 syntax = "proto3";
 package harp;
-option go_package = "github.com/SimonWaldherr/HARP2/harp";
+option go_package = "github.com/SimonWaldherr/HARP/harp";
 
 // Represents an HTTP request forwarded from the proxy to the backend.
 message HTTPRequest {

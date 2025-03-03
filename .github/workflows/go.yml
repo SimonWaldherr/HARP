@@ -7,7 +7,6 @@ on:
     branches: [ "main" ]
 
 jobs:
-
   build:
     runs-on: ubuntu-latest
     steps:
@@ -18,8 +17,21 @@ jobs:
         with:
           go-version: '1.23'
 
+      - name: Cache Go Modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Verify Dependencies
+        run: go mod tidy
+
       - name: Build Proxy
-        run: go build -v -ldflags "-w" -o harpProxy github.com/SimonWaldherr/HARP/ 
-        
+        run: go build -v -ldflags "-w" -o harpProxy ./harp
+
       - name: Build Demo Client
-        run: go build -v -ldflags "-w" -o harpDemoClient github.com/SimonWaldherr/HARP/demos/simple-go/ 
+        run: go build -v -ldflags "-w" -o harpDemoClient ./demos/simple-go

@@ -2,10 +2,8 @@ module github.com/SimonWaldherr/HARP
 
 go 1.23
 
-replace github.com/SimonWaldherr/HARP/harp => ./harp
-
 require (
-	github.com/SimonWaldherr/HARP/harp v0.0.0-00010101000000-000000000000
+	github.com/SimonWaldherr/HARP/harp v1.1.4
 	github.com/google/uuid v1.6.0
 	github.com/quic-go/quic-go v0.49.0
 	google.golang.org/grpc v1.70.0
