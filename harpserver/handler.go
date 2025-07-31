@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/SimonWaldherr/HARP/harp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // BackendServer wraps an HTTP handler so that it can register with HARP.
@@ -26,7 +27,17 @@ type BackendServer struct {
 // ListenAndServeHarp connects to the HARP proxy, registers the backend,
 // and listens for forwarded HTTP requests, dispatching them to the wrapped handler.
 func (s *BackendServer) ListenAndServeHarp() error {
-	conn, err := grpc.Dial(s.ProxyURL, grpc.WithInsecure())
+	// Create connection with proper keepalive settings
+	opts := []grpc.DialOption{
+		grpc.WithInsecure(),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second,  // Ping interval
+			Timeout:             5 * time.Second,   // Ping timeout
+			PermitWithoutStream: true,              // Allow pings without streams
+		}),
+	}
+	
+	conn, err := grpc.Dial(s.ProxyURL, opts...)
 	if err != nil {
 		return err
 	}

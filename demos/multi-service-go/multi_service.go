@@ -17,7 +17,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-var proxyAddr = flag.String("proxy", "localhost:50051", "Address of the HARP proxy")
+var proxyAddr = flag.String("proxy", "localhost:50054", "Address of the HARP proxy")
 
 func main() {
 	flag.Parse()

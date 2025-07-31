@@ -31,16 +31,16 @@ func main() {
 		log.Fatalf("Failed to create gRPC stream: %v", err)
 	}
 
-	// Register a simple route "/test" using the master key.
+	// Register a test route "/enhanced-test" using the master key.
 	reg := &pb.Registration{
-		Name:   "SimpleBackend",
+		Name:   "EnhancedTestBackend",
 		Domain: ".*",
 		Key:    "master-key",
 		Routes: []*pb.Route{
 			{
-				Name:   "TestRoute",
-				Path:   "/test",
-				Port:   8080,
+				Name:   "EnhancedTestRoute",
+				Path:   "/enhanced-test",
+				Port:   8083,
 				Domain: ".*",
 			},
 		},
@@ -50,7 +50,7 @@ func main() {
 	}); err != nil {
 		log.Fatalf("Failed to send registration: %v", err)
 	}
-	log.Println("SimpleBackend registered. Waiting for requests...")
+	log.Println("EnhancedTestBackend registered. Waiting for requests...")
 
 	// Listen for incoming HTTP requests.
 	for {
@@ -65,15 +65,18 @@ func main() {
 		log.Printf("Received request: %s %s", req.Method, req.Url)
 		// Simulate processing.
 		time.Sleep(1 * time.Second)
-		response := fmt.Sprintf("Hello from SimpleBackend! You requested %s", req.Url)
+		response := fmt.Sprintf(`{"message": "Hello from Enhanced HARP Backend!", "url": "%s", "method": "%s", "features": {"caching": "enabled", "metrics": "enabled", "rate_limiting": "enabled"}}`, req.Url, req.Method)
 		resp := &pb.HTTPResponse{
 			Status:    200,
-			Headers:   map[string]string{"Content-Type": "text/plain"},
+			Headers:   map[string]string{
+				"Content-Type": "application/json",
+				"X-Backend": "Enhanced-HARP-v2",
+			},
 			Body:      response,
 			RequestId: req.RequestId,
 			Timestamp: time.Now().UnixNano(),
 			Cacheable: true,
-			Latency:   int64(1 * time.Second),
+			Latency:   int64(10 * time.Millisecond),
 		}
 		if err := stream.Send(&pb.ClientMessage{
 			Payload: &pb.ClientMessage_HttpResponse{HttpResponse: resp},

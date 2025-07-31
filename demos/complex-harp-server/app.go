@@ -42,7 +42,7 @@ func main() {
 		Route:    "/api/",
 		Key:      "master-key",
 		Handler:  router,
-		ProxyURL: "localhost:50051",
+		ProxyURL: "localhost:50054",
 	}
 
 	log.Println("Starting ComplexBackend using HARP wrapper...")

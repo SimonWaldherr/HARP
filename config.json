@@ -1,7 +1,7 @@
 {
-  "grpcPort": ":50051",
+  "grpcPort": ":50054",
   "httpPort": ":8080",
-  "http3Port": ":8443",
+  "http3Port": ":8445",
   "enableGRPCTLS": false,
   "grpcTLSCert": "",
   "grpcTLSKey": "",
@@ -18,5 +18,20 @@
     { "route": "/lorem/.*$",  "key": "ipsum-key" },
     { "route": "/.*$",       "key": "master-key" }
   ],
-  "logLevel": "DEBUG"
+  "logLevel": "DEBUG",
+  
+  "maxConcurrentRequests": 1000,
+  "requestTimeout": "30s",
+  "enableMetrics": true,
+  "metricsPort": ":9091",
+  "enableHealthCheck": true,
+  "healthCheckPath": "/health",
+  "connectionPoolSize": 100,
+  "enableRateLimit": true,
+  "rateLimitPerSecond": 100,
+  "enableCompression": true,
+  "maxHeaderSize": 8192,
+  "readTimeout": "30s",
+  "writeTimeout": "30s",
+  "idleTimeout": "120s"
 }

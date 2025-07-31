@@ -25,7 +25,7 @@ func main() {
 		Route:    "/static/",
 		Key:      "master-key",
 		Handler:  handler,
-		ProxyURL: "localhost:50051",
+		ProxyURL: "localhost:50054",
 	}
 
 	log.Println("Starting StaticFileBackend using HARP wrapper...")
