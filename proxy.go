@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"expvar"
 	"flag"
 	"fmt"
 	"io"
@@ -13,15 +14,14 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
-	"net/http/pprof"
-	"runtime"
-	"expvar"
 
 	pb "github.com/SimonWaldherr/HARP/harp"
 	"github.com/google/uuid"
@@ -49,22 +49,22 @@ type Config struct {
 	CacheTTL            string                    `json:"cacheTTL"`
 	AllowedRegistration []AllowedRegistrationRule `json:"allowedRegistration"`
 	LogLevel            string                    `json:"logLevel"`
-	
+
 	// New optimization settings
 	MaxConcurrentRequests int    `json:"maxConcurrentRequests"`
-	RequestTimeout       string `json:"requestTimeout"`
-	EnableMetrics        bool   `json:"enableMetrics"`
-	MetricsPort          string `json:"metricsPort"`
-	EnableHealthCheck    bool   `json:"enableHealthCheck"`
-	HealthCheckPath      string `json:"healthCheckPath"`
-	ConnectionPoolSize   int    `json:"connectionPoolSize"`
-	EnableRateLimit      bool   `json:"enableRateLimit"`
-	RateLimitPerSecond   int    `json:"rateLimitPerSecond"`
-	EnableCompression    bool   `json:"enableCompression"`
-	MaxHeaderSize        int    `json:"maxHeaderSize"`
-	ReadTimeout          string `json:"readTimeout"`
-	WriteTimeout         string `json:"writeTimeout"`
-	IdleTimeout          string `json:"idleTimeout"`
+	RequestTimeout        string `json:"requestTimeout"`
+	EnableMetrics         bool   `json:"enableMetrics"`
+	MetricsPort           string `json:"metricsPort"`
+	EnableHealthCheck     bool   `json:"enableHealthCheck"`
+	HealthCheckPath       string `json:"healthCheckPath"`
+	ConnectionPoolSize    int    `json:"connectionPoolSize"`
+	EnableRateLimit       bool   `json:"enableRateLimit"`
+	RateLimitPerSecond    int    `json:"rateLimitPerSecond"`
+	EnableCompression     bool   `json:"enableCompression"`
+	MaxHeaderSize         int    `json:"maxHeaderSize"`
+	ReadTimeout           string `json:"readTimeout"`
+	WriteTimeout          string `json:"writeTimeout"`
+	IdleTimeout           string `json:"idleTimeout"`
 }
 
 type AllowedRegistrationRule struct {
@@ -155,7 +155,7 @@ func (mc *MemoryCache) Get(key string) (*pb.HTTPResponse, bool) {
 func (mc *MemoryCache) Set(key string, resp *pb.HTTPResponse) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
-	
+
 	// Simple eviction if cache is full
 	if len(mc.items) >= mc.maxItems {
 		// Remove first item (simple FIFO)
@@ -164,7 +164,7 @@ func (mc *MemoryCache) Set(key string, resp *pb.HTTPResponse) {
 			break
 		}
 	}
-	
+
 	ttl, err := time.ParseDuration(config.CacheTTL)
 	if err != nil {
 		ttl = 30 * time.Minute
@@ -291,13 +291,13 @@ func (rl *RateLimiter) Allow(clientIP string) bool {
 	if !config.EnableRateLimit {
 		return true
 	}
-	
+
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	
+
 	now := time.Now()
 	requests := rl.requests[clientIP]
-	
+
 	// Remove old requests (older than 1 second)
 	var validRequests []time.Time
 	for _, t := range requests {
@@ -305,14 +305,14 @@ func (rl *RateLimiter) Allow(clientIP string) bool {
 			validRequests = append(validRequests, t)
 		}
 	}
-	
+
 	if len(validRequests) >= rl.limit {
 		return false
 	}
-	
+
 	validRequests = append(validRequests, now)
 	rl.requests[clientIP] = validRequests
-	
+
 	return true
 }
 
@@ -363,7 +363,7 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 		"backends":  len(backends),
 		"uptime":    time.Since(startTime).Seconds(),
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(health)
 }
@@ -371,10 +371,10 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 // Metrics endpoint
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	
+
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
-	
+
 	stats := map[string]interface{}{
 		"requests_total":      metrics.RequestsTotal.Value(),
 		"cache_hits":          metrics.CacheHits.Value(),
@@ -389,13 +389,13 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 			"num_gc":      memStats.NumGC,
 		},
 	}
-	
+
 	if cacheStore != nil {
 		stats["cache_stats"] = map[string]interface{}{
 			"size": cacheStore.Size(),
 		}
 	}
-	
+
 	json.NewEncoder(w).Encode(stats)
 }
 
@@ -462,7 +462,7 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 		backendsMu.Unlock()
 		logDebug("Registered route: %s%s", reg.Domain, r.Path)
 	}
-	
+
 	metrics.BackendsRegistered.Add(1)
 	metrics.ActiveConnections.Add(1)
 	defer metrics.ActiveConnections.Add(-1)
@@ -510,14 +510,14 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		metrics.RequestsTotal.Add(1)
 		metrics.RequestDuration.Add(r.URL.Path, int64(duration/time.Millisecond))
 	}()
-	
+
 	// Rate limiting
 	clientIP := r.RemoteAddr
 	if !rateLimiter.Allow(clientIP) {
 		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
-	
+
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Error reading body", http.StatusBadRequest)
@@ -632,16 +632,16 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 // --- Server Starters ---
 func startGRPCServer() {
 	var opts []grpc.ServerOption
-	
+
 	// Add keepalive parameters with more stable settings
 	opts = append(opts, grpc.KeepaliveParams(keepalive.ServerParameters{
-		MaxConnectionIdle:     5 * time.Minute,   // Increased from 15s
-		MaxConnectionAge:      30 * time.Minute,  // Increased from 30s
-		MaxConnectionAgeGrace: 30 * time.Second,  // Increased from 5s
-		Time:                  30 * time.Second,  // Increased from 5s
-		Timeout:               5 * time.Second,   // Increased from 1s
+		MaxConnectionIdle:     5 * time.Minute,  // Increased from 15s
+		MaxConnectionAge:      30 * time.Minute, // Increased from 30s
+		MaxConnectionAgeGrace: 30 * time.Second, // Increased from 5s
+		Time:                  30 * time.Second, // Increased from 5s
+		Timeout:               5 * time.Second,  // Increased from 1s
 	}))
-	
+
 	if config.EnableGRPCTLS {
 		if config.GRPCTLSCert == "" || config.GRPCTLSKey == "" {
 			log.Fatal("grpc-tls enabled but cert or key not provided")
@@ -667,7 +667,7 @@ func startGRPCServer() {
 func startHTTPServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", httpHandler)
-	
+
 	// Add health check endpoint
 	if config.EnableHealthCheck {
 		healthPath := config.HealthCheckPath
@@ -676,12 +676,12 @@ func startHTTPServer() {
 		}
 		mux.HandleFunc(healthPath, healthCheckHandler)
 	}
-	
+
 	// Parse timeouts
 	readTimeout := 30 * time.Second
 	writeTimeout := 30 * time.Second
 	idleTimeout := 120 * time.Second
-	
+
 	if config.ReadTimeout != "" {
 		if parsed, err := time.ParseDuration(config.ReadTimeout); err == nil {
 			readTimeout = parsed
@@ -697,7 +697,7 @@ func startHTTPServer() {
 			idleTimeout = parsed
 		}
 	}
-	
+
 	server := &http.Server{
 		Addr:         config.HTTPPort,
 		Handler:      mux,
@@ -708,7 +708,7 @@ func startHTTPServer() {
 	if config.MaxHeaderSize > 0 {
 		server.MaxHeaderBytes = config.MaxHeaderSize
 	}
-	
+
 	logInfo("HTTP server listening on %s", config.HTTPPort)
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("HTTP server error: %v", err)
@@ -721,7 +721,7 @@ func startHTTPSServer() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", httpHandler)
-	
+
 	if config.EnableHealthCheck {
 		healthPath := config.HealthCheckPath
 		if healthPath == "" {
@@ -729,7 +729,7 @@ func startHTTPSServer() {
 		}
 		mux.HandleFunc(healthPath, healthCheckHandler)
 	}
-	
+
 	server := &http.Server{
 		Addr:         config.HTTPPort,
 		Handler:      mux,
@@ -751,7 +751,7 @@ func startHTTP3Server() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", httpHandler)
-	
+
 	if config.EnableHealthCheck {
 		healthPath := config.HealthCheckPath
 		if healthPath == "" {
@@ -759,7 +759,7 @@ func startHTTP3Server() {
 		}
 		mux.HandleFunc(healthPath, healthCheckHandler)
 	}
-	
+
 	server := &http3.Server{
 		Addr:      config.HTTP3Port,
 		Handler:   mux,
@@ -775,7 +775,7 @@ func startMetricsServer() {
 	if !config.EnableMetrics {
 		return
 	}
-	
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", metricsHandler)
 	mux.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
@@ -784,17 +784,17 @@ func startMetricsServer() {
 	mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
 	mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
 	mux.Handle("/debug/vars", expvar.Handler())
-	
+
 	metricsPort := config.MetricsPort
 	if metricsPort == "" {
 		metricsPort = ":9090"
 	}
-	
+
 	server := &http.Server{
 		Addr:    metricsPort,
 		Handler: mux,
 	}
-	
+
 	logInfo("Metrics server listening on %s", metricsPort)
 	if err := server.ListenAndServe(); err != nil {
 		logError("Metrics server error: %v", err)
@@ -811,7 +811,7 @@ func loadConfig(path string) {
 	if err := decoder.Decode(&config); err != nil {
 		log.Fatalf("Unable to decode config file: %v", err)
 	}
-	
+
 	// Set defaults for new options
 	if config.MaxConcurrentRequests == 0 {
 		config.MaxConcurrentRequests = 1000
@@ -833,7 +833,7 @@ func loadConfig(path string) {
 func main() {
 	configPath := flag.String("config", "config.json", "Path to configuration file")
 	flag.Parse()
-	
+
 	startTime = time.Now()
 	loadConfig(*configPath)
 	logInfo("Enhanced HARP proxy starting with configuration: %s", *configPath)
@@ -842,7 +842,7 @@ func main() {
 	if config.EnableMetrics {
 		initMetrics()
 	}
-	
+
 	// Initialize rate limiter
 	rateLimiter = NewRateLimiter(config.RateLimitPerSecond)
 

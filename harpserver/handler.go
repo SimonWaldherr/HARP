@@ -31,12 +31,12 @@ func (s *BackendServer) ListenAndServeHarp() error {
 	opts := []grpc.DialOption{
 		grpc.WithInsecure(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second,  // Ping interval
-			Timeout:             5 * time.Second,   // Ping timeout
-			PermitWithoutStream: true,              // Allow pings without streams
+			Time:                10 * time.Second, // Ping interval
+			Timeout:             5 * time.Second,  // Ping timeout
+			PermitWithoutStream: true,             // Allow pings without streams
 		}),
 	}
-	
+
 	conn, err := grpc.Dial(s.ProxyURL, opts...)
 	if err != nil {
 		return err

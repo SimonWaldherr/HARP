@@ -67,10 +67,10 @@ func main() {
 		time.Sleep(1 * time.Second)
 		response := fmt.Sprintf(`{"message": "Hello from Enhanced HARP Backend!", "url": "%s", "method": "%s", "features": {"caching": "enabled", "metrics": "enabled", "rate_limiting": "enabled"}}`, req.Url, req.Method)
 		resp := &pb.HTTPResponse{
-			Status:    200,
-			Headers:   map[string]string{
+			Status: 200,
+			Headers: map[string]string{
 				"Content-Type": "application/json",
-				"X-Backend": "Enhanced-HARP-v2",
+				"X-Backend":    "Enhanced-HARP-v2",
 			},
 			Body:      response,
 			RequestId: req.RequestId,

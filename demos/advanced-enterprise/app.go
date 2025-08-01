@@ -79,7 +79,7 @@ var (
 
 func main() {
 	initializeData()
-	
+
 	router := mux.NewRouter()
 
 	// Authentication middleware
@@ -131,7 +131,7 @@ func main() {
 	log.Println("📊 Features: Auth, CRUD, WebSockets, Search, Analytics, File Upload")
 	log.Println("🔧 Endpoints:")
 	log.Println("   - POST /api/auth/login")
-	log.Println("   - POST /api/auth/register") 
+	log.Println("   - POST /api/auth/register")
 	log.Println("   - GET  /api/health")
 	log.Println("   - GET  /api/metrics")
 	log.Println("   - WS   /api/ws (WebSocket)")
@@ -156,9 +156,9 @@ func initializeData() {
 	products[3] = Product{ID: 3, Name: "Mechanical Keyboard", Description: "RGB mechanical keyboard", Price: 129.99, Stock: 50, Category: "Accessories"}
 
 	orders[1] = Order{
-		ID: 1, UserID: 2, 
-		Products: []Product{products[1], products[2]}, 
-		Total: 1349.98, Status: "completed", 
+		ID: 1, UserID: 2,
+		Products: []Product{products[1], products[2]},
+		Total:    1349.98, Status: "completed",
 		Created: time.Now().Format(time.RFC3339),
 	}
 
@@ -225,7 +225,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Generate simple token (in real apps, use JWT)
 	token := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%d", creds.Username, time.Now().UnixNano()))))
-	
+
 	mu.Lock()
 	sessions[token] = user.ID
 	metrics["logins"]++
@@ -285,15 +285,15 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	mu.RUnlock()
 
 	health := map[string]interface{}{
-		"status":        "healthy",
-		"timestamp":     time.Now().Format(time.RFC3339),
-		"uptime":        time.Since(startTime).String(),
-		"version":       "2.0.0",
-		"users":         userCount,
-		"products":      productCount,
-		"orders":        orderCount,
-		"memory_usage":  "45MB", // Simulated
-		"cpu_usage":     "12%",  // Simulated
+		"status":       "healthy",
+		"timestamp":    time.Now().Format(time.RFC3339),
+		"uptime":       time.Since(startTime).String(),
+		"version":      "2.0.0",
+		"users":        userCount,
+		"products":     productCount,
+		"orders":       orderCount,
+		"memory_usage": "45MB", // Simulated
+		"cpu_usage":    "12%",  // Simulated
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -429,7 +429,7 @@ func searchUsersHandler(w http.ResponseWriter, r *http.Request) {
 	var results []User
 	for _, user := range users {
 		if strings.Contains(strings.ToLower(user.Username), strings.ToLower(query)) ||
-		   strings.Contains(strings.ToLower(user.Email), strings.ToLower(query)) {
+			strings.Contains(strings.ToLower(user.Email), strings.ToLower(query)) {
 			results = append(results, user)
 		}
 	}
@@ -455,7 +455,7 @@ func searchProductsHandler(w http.ResponseWriter, r *http.Request) {
 		match := true
 
 		if query != "" && !strings.Contains(strings.ToLower(product.Name), strings.ToLower(query)) &&
-		   !strings.Contains(strings.ToLower(product.Description), strings.ToLower(query)) {
+			!strings.Contains(strings.ToLower(product.Description), strings.ToLower(query)) {
 			match = false
 		}
 
@@ -550,9 +550,9 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 func clearCacheHandler(w http.ResponseWriter, r *http.Request) {
 	// Simulate cache clearing
 	response := map[string]interface{}{
-		"status":   "success",
-		"message":  "Cache cleared successfully",
-		"cleared":  time.Now().Format(time.RFC3339),
+		"status":  "success",
+		"message": "Cache cleared successfully",
+		"cleared": time.Now().Format(time.RFC3339),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -561,9 +561,9 @@ func clearCacheHandler(w http.ResponseWriter, r *http.Request) {
 
 func systemInfoHandler(w http.ResponseWriter, r *http.Request) {
 	info := map[string]interface{}{
-		"version":       "2.0.0",
-		"go_version":    "1.21",
-		"architecture":  "amd64",
+		"version":      "2.0.0",
+		"go_version":   "1.21",
+		"architecture": "amd64",
 		"os":           "linux",
 		"uptime":       time.Since(startTime).String(),
 		"memory": map[string]string{
@@ -576,8 +576,8 @@ func systemInfoHandler(w http.ResponseWriter, r *http.Request) {
 			"usage": "12%",
 		},
 		"connections": map[string]int{
-			"active":    25,
-			"total":     1247,
+			"active": 25,
+			"total":  1247,
 		},
 	}
 
