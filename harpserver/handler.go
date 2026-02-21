@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/SimonWaldherr/HARP/harp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -29,7 +30,7 @@ type BackendServer struct {
 func (s *BackendServer) ListenAndServeHarp() error {
 	// Create connection with proper keepalive settings
 	opts := []grpc.DialOption{
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                10 * time.Second, // Ping interval
 			Timeout:             5 * time.Second,  // Ping timeout
@@ -37,7 +38,7 @@ func (s *BackendServer) ListenAndServeHarp() error {
 		}),
 	}
 
-	conn, err := grpc.Dial(s.ProxyURL, opts...)
+	conn, err := grpc.NewClient(s.ProxyURL, opts...)
 	if err != nil {
 		return err
 	}

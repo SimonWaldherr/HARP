@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/SimonWaldherr/HARP/harp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 var proxyAddr = flag.String("proxy", "localhost:50054", "Address of the HARP proxy")
@@ -18,7 +19,7 @@ func main() {
 	flag.Parse()
 
 	// Connect to the proxy.
-	conn, err := grpc.Dial(*proxyAddr, grpc.WithInsecure())
+	conn, err := grpc.NewClient(*proxyAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("Failed to connect to proxy: %v", err)
 	}
