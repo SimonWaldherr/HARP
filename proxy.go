@@ -10,7 +10,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -208,7 +207,7 @@ func (dc *DiskCache) cacheFile(key string) string {
 
 func (dc *DiskCache) Get(key string) (*pb.HTTPResponse, bool) {
 	filename := dc.cacheFile(key)
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, false
 	}
@@ -244,7 +243,7 @@ func (dc *DiskCache) Set(key string, resp *pb.HTTPResponse) {
 		return
 	}
 	filename := dc.cacheFile(key)
-	if err := ioutil.WriteFile(filename, data, 0644); err != nil {
+	if err := os.WriteFile(filename, data, 0644); err != nil {
 		logError("Error writing cache file: %v", err)
 	}
 }
@@ -838,10 +837,8 @@ func main() {
 	loadConfig(*configPath)
 	logInfo("Enhanced HARP proxy starting with configuration: %s", *configPath)
 
-	// Initialize metrics if enabled
-	if config.EnableMetrics {
-		initMetrics()
-	}
+	// Always initialize metrics (used in httpHandler unconditionally)
+	initMetrics()
 
 	// Initialize rate limiter
 	rateLimiter = NewRateLimiter(config.RateLimitPerSecond)
