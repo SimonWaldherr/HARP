@@ -159,11 +159,69 @@ The **demos/** folder includes several backend examples:
 4. **complex-harp-server:**  
    A more complex example with multiple routes.
 
+5. **Remote Helper (demos/remote-helper-go):**  
+   A lightweight helper running on a home network that exposes local resources
+   (Home Assistant state, local commands) to a public HARP proxy without
+   requiring any inbound firewall rules.
+
 ---
 
 ## Using the Web Handler Wrapper
 
-The new helper in `harp/handler.go` (the `BackendServer` type and its `ListenAndServeHarp()` method) lets you wrap an existing `http.Handler` so that your web application can be exposed via HARP with minimal changes. 
+The `BackendServer` type in `harpserver/handler.go` and its `ListenAndServeHarp()` method lets you wrap an existing `http.Handler` so that your web application can be exposed via HARP with minimal changes.
+
+**Multi-route support:** Populate the `Routes []RouteConfig` field to register different routes each served by their own `http.Handler`:
+
+```go
+server := &harpserver.BackendServer{
+    Name:     "MyService",
+    ProxyURL: "proxy.example.com:50054",
+    Key:      "master-key",
+    Domain:   ".*",
+    Routes: []harpserver.RouteConfig{
+        {Name: "API",    Path: "/api/",  Handler: apiRouter},
+        {Name: "Static", Path: "/static/", Handler: staticHandler},
+    },
+    ReconnectInterval: 5 * time.Second, // auto-reconnect on disconnect
+}
+server.ListenAndServeHarp()
+```
+
+---
+
+## Remote Helpers (OpenClaw / libreClaw use-case)
+
+`RemoteHelper` (in `harpserver/helper.go`) enables a lightweight agent running
+on a **private network** (e.g. a MacBook at home) to register function-based
+route handlers with a **public HARP proxy** without needing open inbound ports.
+
+This is the recommended approach for:
+- Home automation bridges (Home Assistant, Apple HomeKit, …)
+- IoT device proxies behind NAT
+- Developer laptops exposing local services for testing
+
+```go
+helper := &harpserver.RemoteHelper{
+    Name:              "HomeNetworkHelper",
+    ProxyURL:          "proxy.example.com:50054",
+    Key:               "master-key",
+    Domain:            ".*",
+    ReconnectInterval: 5 * time.Second,
+}
+
+// Register a route that queries the local Home Assistant instance.
+helper.Register("/helper/homeassistant", "HomeAssistant",
+    func(r *http.Request) (int, map[string]string, string) {
+        entity := r.URL.Query().Get("entity")
+        // Call http://localhost:8123/api/states/<entity> here …
+        return 200, map[string]string{"Content-Type": "application/json"}, `{"state":"on"}`
+    },
+)
+
+log.Fatal(helper.ListenAndServe()) // blocks; auto-reconnects on disconnect
+```
+
+See `demos/remote-helper-go/main.go` for a full working example.
 
 ---
 

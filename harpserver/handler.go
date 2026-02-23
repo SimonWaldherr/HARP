@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	pb "github.com/SimonWaldherr/HARP/harp"
@@ -15,7 +16,18 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
+// RouteConfig binds a route path to a dedicated HTTP handler.
+// It is used by BackendServer to register multiple routes, each served
+// by a different http.Handler.
+type RouteConfig struct {
+	Name    string
+	Path    string
+	Handler http.Handler
+}
+
 // BackendServer wraps an HTTP handler so that it can register with HARP.
+// For multi-route setups populate Routes instead of the single Route/Handler pair.
+// Set ReconnectInterval > 0 to enable automatic reconnection on stream failure.
 type BackendServer struct {
 	Name     string
 	Domain   string
@@ -23,18 +35,36 @@ type BackendServer struct {
 	Key      string
 	Handler  http.Handler
 	ProxyURL string
+	// Routes registers multiple path→handler mappings.
+	// When set, the single Route/Handler fields are ignored.
+	Routes []RouteConfig
+	// ReconnectInterval is the delay between reconnect attempts.
+	// Zero (default) means no automatic reconnection.
+	ReconnectInterval time.Duration
 }
 
 // ListenAndServeHarp connects to the HARP proxy, registers the backend,
 // and listens for forwarded HTTP requests, dispatching them to the wrapped handler.
+// If ReconnectInterval > 0, it automatically reconnects on stream failure.
 func (s *BackendServer) ListenAndServeHarp() error {
-	// Create connection with proper keepalive settings
+	if s.ReconnectInterval > 0 {
+		for {
+			if err := s.connect(); err != nil {
+				log.Printf("Backend %s disconnected: %v. Reconnecting in %s...", s.Name, err, s.ReconnectInterval)
+				time.Sleep(s.ReconnectInterval)
+			}
+		}
+	}
+	return s.connect()
+}
+
+func (s *BackendServer) connect() error {
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second, // Ping interval
-			Timeout:             5 * time.Second,  // Ping timeout
-			PermitWithoutStream: true,             // Allow pings without streams
+			Time:                10 * time.Second,
+			Timeout:             5 * time.Second,
+			PermitWithoutStream: true,
 		}),
 	}
 
@@ -51,25 +81,39 @@ func (s *BackendServer) ListenAndServeHarp() error {
 		return err
 	}
 
-	// Send registration request.
+	// Build route list and per-path handler map.
+	routeMap := make(map[string]http.Handler)
+	var protoRoutes []*pb.Route
+	if len(s.Routes) > 0 {
+		for _, r := range s.Routes {
+			protoRoutes = append(protoRoutes, &pb.Route{
+				Name:   r.Name,
+				Path:   r.Path,
+				Domain: s.Domain,
+			})
+			routeMap[r.Path] = r.Handler
+		}
+	} else {
+		protoRoutes = []*pb.Route{{
+			Name:   s.Name,
+			Path:   s.Route,
+			Domain: s.Domain,
+		}}
+		routeMap[s.Route] = s.Handler
+	}
+
 	reg := &pb.Registration{
 		Name:   s.Name,
 		Domain: s.Domain,
 		Key:    s.Key,
-		Routes: []*pb.Route{
-			{
-				Name:   s.Name,
-				Path:   s.Route,
-				Domain: s.Domain,
-			},
-		},
+		Routes: protoRoutes,
 	}
 	if err := stream.Send(&pb.ClientMessage{
 		Payload: &pb.ClientMessage_Registration{Registration: reg},
 	}); err != nil {
 		return err
 	}
-	log.Printf("Backend %s registered with route %s", s.Name, s.Route)
+	log.Printf("Backend %s registered with %d route(s)", s.Name, len(protoRoutes))
 
 	// Listen for forwarded HTTP requests.
 	for {
@@ -90,9 +134,25 @@ func (s *BackendServer) ListenAndServeHarp() error {
 			continue
 		}
 
+		// Dispatch to the best-matching handler (longest prefix wins).
+		handler := s.Handler
+		if len(routeMap) > 0 {
+			var bestLen int
+			for path, h := range routeMap {
+				if strings.HasPrefix(req.URL.Path, path) && len(path) > bestLen {
+					handler = h
+					bestLen = len(path)
+				}
+			}
+		}
+
 		// Create a response recorder.
 		recorder := newResponseRecorder()
-		s.Handler.ServeHTTP(recorder, req)
+		if handler != nil {
+			handler.ServeHTTP(recorder, req)
+		} else {
+			recorder.WriteHeader(http.StatusNotFound)
+		}
 
 		// Build HTTPResponse proto.
 		respProto := &pb.HTTPResponse{
