@@ -2,3 +2,4 @@ _old
 harpDemoClient
 harpProxy
 bin
+demos/remote-helper-go/remote-helper-demo
