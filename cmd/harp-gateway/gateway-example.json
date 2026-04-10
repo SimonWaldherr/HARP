@@ -1,0 +1,38 @@
+{
+  "name": "raspi-gateway",
+  "proxyURL": "proxy.example.com:50054",
+  "key": "master-key",
+  "domain": ".*",
+  "reconnectInterval": "5s",
+  "services": [
+    {
+      "name": "Home Assistant",
+      "route": "/homeassistant/",
+      "upstream": "http://localhost:8123",
+      "stripPrefix": true,
+      "addHeaders": {
+        "Authorization": "Bearer YOUR_HA_LONG_LIVED_TOKEN"
+      },
+      "timeoutSeconds": 15
+    },
+    {
+      "name": "Pi-hole Admin",
+      "route": "/pihole/",
+      "upstream": "http://localhost:80/admin",
+      "stripPrefix": true
+    },
+    {
+      "name": "Grafana",
+      "route": "/grafana/",
+      "upstream": "http://localhost:3000",
+      "stripPrefix": true
+    },
+    {
+      "name": "Local API",
+      "route": "/api/",
+      "upstream": "http://localhost:9000",
+      "stripPrefix": false,
+      "timeoutSeconds": 60
+    }
+  ]
+}

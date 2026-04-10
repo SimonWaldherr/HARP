@@ -3,7 +3,7 @@ module github.com/SimonWaldherr/HARP
 go 1.23
 
 require (
-	github.com/SimonWaldherr/HARP/harp v1.1.6
+	github.com/SimonWaldherr/HARP/harp v1.1.7
 	github.com/SimonWaldherr/HARP/harpserver v1.1.5
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1
@@ -27,4 +27,9 @@ require (
 	golang.org/x/tools v0.22.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20241202173237-19429a94021a // indirect
 	google.golang.org/protobuf v1.36.5 // indirect
+)
+
+replace (
+	github.com/SimonWaldherr/HARP/harp => ./harp
+	github.com/SimonWaldherr/HARP/harpserver => ./harpserver
 )

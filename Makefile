@@ -1,12 +1,14 @@
-.PHONY: all build build-proxy build-demos fmt vet lint test test-verbose test-cover \
-       run run-proxy run-demo-simple run-demo-complex run-demo-enhanced \
+.PHONY: all build build-proxy build-gateway build-demos fmt vet lint test test-verbose test-cover \
+       run run-proxy run-gateway run-demo-simple run-demo-complex run-demo-enhanced \
        run-demo-multi run-demo-remote-helper run-demo-static clean proto help
 
 # ── Variables ────────────────────────────────────────────────────────────────
 BINARY       := bin/harp-proxy
+GATEWAY      := bin/harp-gateway
 GO           := go
 GOFLAGS      ?=
 CONFIG       ?= config.json
+GATEWAY_CFG  ?= cmd/harp-gateway/gateway-example.json
 PROXY_ADDR   ?= localhost:50054
 
 # Demo binaries
@@ -16,10 +18,13 @@ DEMOS := simple-go complex-harp-server enhanced-go multi-service-go static-wrapp
 all: fmt vet test build ## Format, vet, test, and build everything
 
 # ── Build ────────────────────────────────────────────────────────────────────
-build: build-proxy build-demos ## Build proxy and all demos
+build: build-proxy build-gateway build-demos ## Build proxy, gateway, and all demos
 
 build-proxy: ## Build the HARP proxy binary
 	$(GO) build $(GOFLAGS) -o $(BINARY) .
+
+build-gateway: ## Build the harp-gateway agent
+	$(GO) build $(GOFLAGS) -o $(GATEWAY) ./cmd/harp-gateway
 
 build-demos: ## Build all demo backends
 	@for demo in $(DEMOS); do \
@@ -63,6 +68,9 @@ run: run-proxy ## Alias for run-proxy
 
 run-proxy: build-proxy ## Build and run the HARP proxy
 	./$(BINARY) -config $(CONFIG)
+
+run-gateway: build-gateway ## Build and run the harp-gateway agent
+	./$(GATEWAY) -config $(GATEWAY_CFG)
 
 run-demo-simple: ## Run the simple-go demo backend (proxy must be running)
 	$(GO) run ./demos/simple-go -proxy $(PROXY_ADDR)
@@ -113,7 +121,7 @@ proto: ## Regenerate protobuf/gRPC code from harp.proto
 
 # ── Maintenance ──────────────────────────────────────────────────────────────
 clean: ## Remove build artifacts
-	rm -f $(BINARY) coverage.out
+	rm -f $(BINARY) $(GATEWAY) coverage.out
 	rm -f bin/demo-*
 
 deps: ## Download and tidy dependencies

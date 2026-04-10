@@ -35,6 +35,7 @@ Unlike traditional reverse proxies (nginx, HAProxy, Traefik) that require the ba
 - [Makefile](#makefile)
 - [Examples](#examples)
 - [Using the Web Handler Wrapper](#using-the-web-handler-wrapper)
+- [HARP Gateway Agent](#harp-gateway-agent)
 - [License](#license)
 
 ---
@@ -209,11 +210,13 @@ A `Makefile` is provided for common workflows:
 
 ```bash
 make              # fmt + vet + test + build
-make build        # Build proxy and all demo binaries
+make build        # Build proxy, gateway, and all demo binaries
+make build-gateway # Build just the harp-gateway agent
 make test         # Run all tests
 make test-cover   # Tests with coverage report
 make test-race    # Tests with Go race detector
 make run          # Build and start the proxy
+make run-gateway  # Build and start the gateway agent
 make demo         # Full end-to-end demo (proxy + backend + curl)
 make clean        # Remove build artifacts
 make help         # Show all available targets
@@ -307,6 +310,75 @@ log.Fatal(helper.ListenAndServe()) // blocks; auto-reconnects on disconnect
 ```
 
 See `demos/remote-helper-go/main.go` for a full working example.
+
+---
+
+## HARP Gateway Agent
+
+The **harp-gateway** (`cmd/harp-gateway/`) is a standalone binary that exposes local HTTP services through a remote HARP proxy — configured entirely via a JSON file, no Go code required. Install it on a Raspberry Pi, NAS, or any machine on your home network and describe which local services to publish:
+
+```bash
+make build-gateway
+./bin/harp-gateway -config gateway.json
+```
+
+### Gateway Config (`gateway.json`)
+
+```json
+{
+  "name": "raspi-gateway",
+  "proxyURL": "proxy.example.com:50054",
+  "key": "master-key",
+  "domain": ".*",
+  "reconnectInterval": "5s",
+  "services": [
+    {
+      "name": "Home Assistant",
+      "route": "/homeassistant/",
+      "upstream": "http://localhost:8123",
+      "stripPrefix": true,
+      "addHeaders": {
+        "Authorization": "Bearer YOUR_HA_TOKEN"
+      },
+      "timeoutSeconds": 15
+    },
+    {
+      "name": "Pi-hole Admin",
+      "route": "/pihole/",
+      "upstream": "http://localhost:80/admin",
+      "stripPrefix": true
+    },
+    {
+      "name": "Grafana",
+      "route": "/grafana/",
+      "upstream": "http://localhost:3000",
+      "stripPrefix": true
+    }
+  ]
+}
+```
+
+### Service Config Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | *required* | Human-readable service label |
+| `route` | string | *required* | Public path prefix registered with the proxy |
+| `upstream` | string | *required* | Local HTTP base URL to forward requests to |
+| `stripPrefix` | bool | `false` | Remove the route prefix before forwarding (e.g. `/pihole/admin/index` → `/admin/index`) |
+| `addHeaders` | object | `{}` | Extra headers injected into every upstream request (auth tokens, API keys, …) |
+| `timeoutSeconds` | int | `30` | Per-request timeout for the upstream call |
+
+### How It Works
+
+1. The gateway reads `gateway.json` and registers one HARP route per service.
+2. When a client hits `https://proxy.example.com/homeassistant/api/states`, the HARP proxy forwards the request to the gateway over gRPC.
+3. The gateway strips the `/homeassistant` prefix (if configured), adds any extra headers, and forwards to `http://localhost:8123/api/states`.
+4. The upstream response is relayed back through gRPC to the proxy and then to the client.
+
+Auto-reconnect is built in — if the connection to the proxy drops, the gateway retries every `reconnectInterval`.
+
+See [cmd/harp-gateway/gateway-example.json](cmd/harp-gateway/gateway-example.json) for the full example config.
 
 ---
 
