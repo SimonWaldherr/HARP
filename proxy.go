@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -15,11 +16,13 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	pb "github.com/SimonWaldherr/HARP/harp"
@@ -64,6 +67,10 @@ type Config struct {
 	ReadTimeout           string `json:"readTimeout"`
 	WriteTimeout          string `json:"writeTimeout"`
 	IdleTimeout           string `json:"idleTimeout"`
+	MaxRequestBodySize    int64  `json:"maxRequestBodySize"`
+	EnableCORS            bool   `json:"enableCORS"`
+	CORSAllowedOrigins    string `json:"corsAllowedOrigins"`
+	GracefulShutdownDelay string `json:"gracefulShutdownDelay"`
 }
 
 type AllowedRegistrationRule struct {
@@ -80,6 +87,8 @@ type Metrics struct {
 	BackendErrors      *expvar.Int
 	ActiveConnections  *expvar.Int
 	BackendsRegistered *expvar.Int
+	RouteRequests      *expvar.Map
+	RateLimited        *expvar.Int
 }
 
 var (
@@ -97,6 +106,8 @@ func initMetrics() {
 		BackendErrors:      expvar.NewInt("backend_errors_total"),
 		ActiveConnections:  expvar.NewInt("active_connections"),
 		BackendsRegistered: expvar.NewInt("backends_registered"),
+		RouteRequests:      expvar.NewMap("route_requests_total"),
+		RateLimited:        expvar.NewInt("rate_limited_total"),
 	}
 }
 
@@ -155,12 +166,26 @@ func (mc *MemoryCache) Set(key string, resp *pb.HTTPResponse) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
-	// Simple eviction if cache is full
+	// LRU eviction: remove the item closest to expiry
 	if len(mc.items) >= mc.maxItems {
-		// Remove first item (simple FIFO)
-		for k := range mc.items {
-			delete(mc.items, k)
-			break
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, v := range mc.items {
+			// Also evict already-expired entries first
+			if time.Now().After(v.expiresAt) {
+				delete(mc.items, k)
+				first = false
+				break
+			}
+			if first || v.expiresAt.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.expiresAt
+				first = false
+			}
+		}
+		if first == false && oldestKey != "" && len(mc.items) >= mc.maxItems {
+			delete(mc.items, oldestKey)
 		}
 	}
 
@@ -315,6 +340,26 @@ func (rl *RateLimiter) Allow(clientIP string) bool {
 	return true
 }
 
+// Cleanup removes stale entries from the rate limiter to prevent memory leaks.
+func (rl *RateLimiter) Cleanup() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	for ip, requests := range rl.requests {
+		var valid []time.Time
+		for _, t := range requests {
+			if now.Sub(t) < time.Second {
+				valid = append(valid, t)
+			}
+		}
+		if len(valid) == 0 {
+			delete(rl.requests, ip)
+		} else {
+			rl.requests[ip] = valid
+		}
+	}
+}
+
 var rateLimiter *RateLimiter
 
 // getCacheKey computes a key for caching.
@@ -381,6 +426,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		"backend_errors":      metrics.BackendErrors.Value(),
 		"active_connections":  metrics.ActiveConnections.Value(),
 		"backends_registered": metrics.BackendsRegistered.Value(),
+		"rate_limited":        metrics.RateLimited.Value(),
 		"memory_stats": map[string]interface{}{
 			"alloc":       memStats.Alloc,
 			"total_alloc": memStats.TotalAlloc,
@@ -510,22 +556,49 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		metrics.RequestDuration.Add(r.URL.Path, int64(duration/time.Millisecond))
 	}()
 
+	// CORS handling
+	if config.EnableCORS {
+		origin := config.CORSAllowedOrigins
+		if origin == "" {
+			origin = "*"
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
 	// Rate limiting
 	clientIP := r.RemoteAddr
 	if !rateLimiter.Allow(clientIP) {
+		metrics.RateLimited.Add(1)
 		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 
-	bodyBytes, err := io.ReadAll(r.Body)
+	// Enforce request body size limit
+	var bodyReader io.Reader = r.Body
+	if config.MaxRequestBodySize > 0 {
+		bodyReader = io.LimitReader(r.Body, config.MaxRequestBodySize+1)
+	}
+	bodyBytes, err := io.ReadAll(bodyReader)
 	if err != nil {
 		http.Error(w, "Error reading body", http.StatusBadRequest)
 		return
 	}
 	r.Body.Close()
+	if config.MaxRequestBodySize > 0 && int64(len(bodyBytes)) > config.MaxRequestBodySize {
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	bodyStr := string(bodyBytes)
 
 	reqID := uuid.New().String()
+	w.Header().Set("X-Request-ID", reqID)
 	headers := make(map[string]string)
 	for k, v := range r.Header {
 		if len(v) > 0 {
@@ -558,21 +631,25 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		Timestamp: time.Now().UnixNano(),
 	}
 
-	// Find a matching backend.
+	// Find the best matching backend (longest path wins).
 	var chosen *backendConn
+	var matchedRoute string
+	var bestLen int
 	backendsMu.RLock()
 	for _, conn := range backends {
 		for _, route := range conn.routes {
-			if route.pattern.MatchString(r.URL.Path) {
+			if route.pattern.MatchString(r.URL.Path) && len(route.path) > bestLen {
 				chosen = conn
-				break
+				matchedRoute = route.path
+				bestLen = len(route.path)
 			}
-		}
-		if chosen != nil {
-			break
 		}
 	}
 	backendsMu.RUnlock()
+
+	if matchedRoute != "" {
+		metrics.RouteRequests.Add(matchedRoute, 1)
+	}
 
 	if chosen == nil {
 		logWarn("No matching route for %s", r.URL.String())
@@ -827,6 +904,38 @@ func loadConfig(path string) {
 	if config.MaxHeaderSize == 0 {
 		config.MaxHeaderSize = 8192
 	}
+	if config.MaxRequestBodySize == 0 {
+		config.MaxRequestBodySize = 10 * 1024 * 1024 // 10MB default
+	}
+	if config.GracefulShutdownDelay == "" {
+		config.GracefulShutdownDelay = "10s"
+	}
+
+	// Validate config
+	if config.EnableGRPCTLS && (config.GRPCTLSCert == "" || config.GRPCTLSKey == "") {
+		log.Fatal("Config error: enableGRPCTLS requires grpcTLSCert and grpcTLSKey")
+	}
+	if config.EnableHTTPS && (config.HTTPSCert == "" || config.HTTPSKey == "") {
+		log.Fatal("Config error: enableHTTPS requires httpsCert and httpsKey")
+	}
+	if config.EnableHTTP3 && !config.EnableHTTPS {
+		log.Fatal("Config error: enableHTTP3 requires enableHTTPS")
+	}
+	if config.CacheTTL != "" {
+		if _, err := time.ParseDuration(config.CacheTTL); err != nil {
+			log.Fatalf("Config error: invalid cacheTTL %q: %v", config.CacheTTL, err)
+		}
+	}
+	if config.RequestTimeout != "" {
+		if _, err := time.ParseDuration(config.RequestTimeout); err != nil {
+			log.Fatalf("Config error: invalid requestTimeout %q: %v", config.RequestTimeout, err)
+		}
+	}
+	for _, rule := range config.AllowedRegistration {
+		if _, err := regexp.Compile(rule.Route); err != nil {
+			log.Fatalf("Config error: invalid regex in allowedRegistration route %q: %v", rule.Route, err)
+		}
+	}
 }
 
 func main() {
@@ -842,6 +951,15 @@ func main() {
 
 	// Initialize rate limiter
 	rateLimiter = NewRateLimiter(config.RateLimitPerSecond)
+
+	// Start periodic rate limiter cleanup
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			rateLimiter.Cleanup()
+		}
+	}()
 
 	// Initialize cache.
 	switch strings.ToLower(config.CacheType) {
@@ -867,8 +985,25 @@ func main() {
 		if config.EnableHTTP3 {
 			go startHTTP3Server()
 		}
-		startHTTPSServer()
+		go startHTTPSServer()
 	} else {
-		startHTTPServer()
+		go startHTTPServer()
 	}
+
+	// Wait for shutdown signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	logInfo("Shutdown signal received, draining connections...")
+
+	shutdownDelay := 10 * time.Second
+	if d, err := time.ParseDuration(config.GracefulShutdownDelay); err == nil {
+		shutdownDelay = d
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownDelay)
+	defer cancel()
+
+	// Log shutdown completion
+	<-ctx.Done()
+	logInfo("HARP proxy stopped")
 }

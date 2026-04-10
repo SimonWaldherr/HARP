@@ -4,18 +4,35 @@
 [![Build](https://github.com/SimonWaldherr/HARP/actions/workflows/go.yml/badge.svg?branch=main)](https://github.com/SimonWaldherr/HARP/actions/workflows/go.yml)
 [![License: GPL](https://img.shields.io/badge/license-GPL-blue.svg)](./LICENSE)
 
-HARP is a dynamic reverse proxy designed to expose backend applications (even those hidden behind NAT or firewalls) to the Internet without directly exposing them. Backends connect via gRPC, register their HTTP endpoints, and receive forwarded HTTP requests. The proxy now supports a structured configuration for per‑route authentication and includes a helper to easily wrap existing web‑applications.
+HARP is a dynamic reverse proxy designed to expose backend applications (even those hidden behind NAT or firewalls) to the Internet without directly exposing them. Backends connect via gRPC, register their HTTP endpoints, and receive forwarded HTTP requests. The proxy supports per‑route authentication, caching, rate limiting, CORS, graceful shutdown, and includes helpers to easily wrap existing web‑applications.
+
+---
+
+## Why HARP?
+
+Exposing a service on the Internet traditionally requires a public IP address, open firewall ports, DNS configuration, and TLS certificates — all before a single request is served. For devices behind NAT (home servers, Raspberry Pis, IoT gateways) or ephemeral developer machines, this is impractical or impossible.
+
+HARP flips the model: **the backend initiates the connection outward** to a publicly hosted proxy. No inbound ports, no port forwarding, no VPN tunnels. The proxy accepts regular HTTP traffic from clients and shuttles it to the correct backend over a persistent gRPC stream. This means:
+
+- **A Raspberry Pi behind a home router** can serve a public website without touching the router config.
+- **A corporate laptop** can expose a local dev server to external testers with zero infrastructure changes.
+- **IoT devices and home automation hubs** (Home Assistant, sensor networks) become reachable from anywhere, authenticated and rate‑limited at the proxy layer.
+- **Microservices in restricted networks** can register and deregister routes dynamically, turning the proxy into a self‑updating service mesh entry point.
+
+Unlike traditional reverse proxies (nginx, HAProxy, Traefik) that require the backend to be network‑reachable from the proxy, HARP works in the opposite direction. Unlike tunneling tools (ngrok, Cloudflare Tunnel) it is fully self‑hosted, open source, and gives you complete control over routing, authentication, caching, and observability — all in a single, dependency‑free Go binary.
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Features](#features)
 - [Architecture](#architecture)
 - [How It Works](#how-it-works)
 - [Sequence Diagram](#sequence-diagram)
 - [Installation & Usage](#installation--usage)
 - [Configuration](#configuration)
+- [Makefile](#makefile)
 - [Examples](#examples)
 - [Using the Web Handler Wrapper](#using-the-web-handler-wrapper)
 - [License](#license)
@@ -25,6 +42,25 @@ HARP is a dynamic reverse proxy designed to expose backend applications (even th
 ## Overview
 
 HARP allows your internal servers (or devices like Raspberry Pis) to securely expose HTTP endpoints by connecting to a publicly hosted proxy. The backends register via gRPC using a per‑route authentication mechanism defined in the configuration. Existing web‑applications can be integrated easily using the provided handler wrapper.
+
+---
+
+## Features
+
+- **Per-route authentication** with regex matching and secret keys
+- **In-memory and disk-based caching** with configurable TTL and LRU eviction
+- **Rate limiting** per client IP with automatic memory cleanup
+- **Request body size limits** to prevent abuse and OOM
+- **CORS support** with configurable allowed origins
+- **X-Request-ID tracing** — every proxied response includes a unique request ID header
+- **Per-route metrics** — track request counts per route via `/metrics`
+- **Graceful shutdown** — drains connections on SIGINT/SIGTERM
+- **Health check endpoint** at `/health` with uptime and backend count
+- **Prometheus-style metrics** and pprof profiling endpoints
+- **HTTP, HTTPS, and HTTP/3** support
+- **Config validation** on startup (TLS, regex, duration parsing)
+- **Auto-reconnecting backends** with configurable reconnect interval
+- **Two integration modes:** `BackendServer` (wrap `http.Handler`) and `RemoteHelper` (function-based)
 
 ---
 
@@ -96,50 +132,99 @@ sequenceDiagram
 ### Build & Run
 
 1. **Configuration:**  
-   Adjust the settings in `config.json` as required. Note the new `allowedRegistration` section which defines allowed route regexes and their corresponding keys.
+   Adjust the settings in `config.json` as required. See the [Configuration](#configuration) section below.
 
-2. **Build the Proxy:**  
+2. **Build everything (proxy + demos):**  
    ```bash
-   go build -o bin/harp-proxy proxy.go
+   make build
    ```
 
 3. **Run the Proxy:**  
    ```bash
+   make run
+   # or directly:
    ./bin/harp-proxy -config config.json
    ```
 
 4. **Run a Backend Example:**  
-   For example, in `demos/simple-go`:
    ```bash
-   go run app.go -proxy localhost:50051
+   make run-demo-simple
+   ```
+
+5. **Full demo workflow** (starts proxy, demo backend, sends a test request, then cleans up):
+   ```bash
+   make demo
    ```
 
 ---
 
 ## Configuration
 
-The `config.json` file controls the proxy behavior. Key settings include:
+The `config.json` file controls the proxy behavior:
 
-- **Ports & TLS:**  
-  - `grpcPort`, `httpPort`, `http3Port`
-  - TLS settings for gRPC and HTTPS/HTTP3
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `grpcPort` | string | `:50054` | gRPC server listen address |
+| `httpPort` | string | `:8080` | HTTP server listen address |
+| `http3Port` | string | `:8445` | HTTP/3 (QUIC) listen address |
+| `enableGRPCTLS` | bool | `false` | Enable TLS for gRPC |
+| `enableHTTPS` | bool | `false` | Enable HTTPS server |
+| `enableHTTP3` | bool | `false` | Enable HTTP/3 (requires HTTPS) |
+| `enableCache` | bool | `true` | Enable response caching |
+| `cacheType` | string | `memory` | `memory` or `disk` |
+| `cacheTTL` | string | `30m` | Cache entry TTL (Go duration) |
+| `enableRateLimit` | bool | `true` | Enable per-IP rate limiting |
+| `rateLimitPerSecond` | int | `100` | Max requests per second per IP |
+| `maxRequestBodySize` | int | `10485760` | Max request body in bytes (10 MB) |
+| `enableCORS` | bool | `false` | Enable CORS headers |
+| `corsAllowedOrigins` | string | `*` | Allowed CORS origins |
+| `enableHealthCheck` | bool | `true` | Enable `/health` endpoint |
+| `enableMetrics` | bool | `true` | Enable `/metrics` + pprof |
+| `metricsPort` | string | `:9091` | Metrics server listen address |
+| `requestTimeout` | string | `30s` | Backend response timeout |
+| `readTimeout` | string | `30s` | HTTP read timeout |
+| `writeTimeout` | string | `30s` | HTTP write timeout |
+| `idleTimeout` | string | `120s` | HTTP idle timeout |
+| `maxHeaderSize` | int | `8192` | Max HTTP header bytes |
+| `gracefulShutdownDelay` | string | `10s` | Drain time on SIGINT/SIGTERM |
+| `logLevel` | string | `DEBUG` | Log level (`DEBUG`, `INFO`, …) |
 
-- **Caching:**  
-  - `enableCache`, `cacheType` (`memory` or `disk`), `cacheTTL`
+**Allowed Registrations:**
 
-- **Allowed Registrations:**  
-  A list of objects defining allowed registration rules. For example:
-  ```json
-  "allowedRegistration": [
-    { "route": "/foobar/.*$", "key": "secret1" },
-    { "route": "/lorem/.*$",  "key": "ipsum-key" },
-    { "route": "/.*$",       "key": "master-key" }
-  ]
-  ```
-  When a backend registers, each of its routes is checked against these rules. Only routes matching a rule with the correct key are accepted.
+```json
+"allowedRegistration": [
+  { "route": "/foobar/.*$", "key": "secret1" },
+  { "route": "/lorem/.*$",  "key": "ipsum-key" },
+  { "route": "/.*$",       "key": "master-key" }
+]
+```
 
-- **Logging:**  
-  Set via `logLevel` (e.g. DEBUG, INFO).
+When a backend registers, each route is checked against these rules. Only routes matching a rule regex with the correct key are accepted. Invalid regexes are caught at startup.
+
+---
+
+## Makefile
+
+A `Makefile` is provided for common workflows:
+
+```bash
+make              # fmt + vet + test + build
+make build        # Build proxy and all demo binaries
+make test         # Run all tests
+make test-cover   # Tests with coverage report
+make test-race    # Tests with Go race detector
+make run          # Build and start the proxy
+make demo         # Full end-to-end demo (proxy + backend + curl)
+make clean        # Remove build artifacts
+make help         # Show all available targets
+```
+
+Override defaults with environment variables:
+
+```bash
+CONFIG=production.json make run
+PROXY_ADDR=remote.host:50054 make run-demo-simple
+```
 
 ---
 
@@ -222,6 +307,21 @@ log.Fatal(helper.ListenAndServe()) // blocks; auto-reconnects on disconnect
 ```
 
 See `demos/remote-helper-go/main.go` for a full working example.
+
+---
+
+## Observability
+
+When `enableMetrics` is `true`, a separate HTTP server starts on `metricsPort` exposing:
+
+| Endpoint | Description |
+|----------|-------------|
+| `/metrics` | JSON metrics: request totals, cache hits/misses, backend errors, per-route counts, rate-limited requests, memory stats |
+| `/health` | Health check with uptime and connected backend count |
+| `/debug/pprof/` | Go pprof profiling endpoints |
+| `/debug/vars` | expvar variables |
+
+Every proxied response includes an `X-Request-ID` header for end-to-end tracing.
 
 ---
 

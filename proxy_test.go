@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -137,4 +138,153 @@ func TestInitMetrics(t *testing.T) {
 	if metrics.CacheHits == nil {
 		t.Error("CacheHits should not be nil")
 	}
+	if metrics.RouteRequests == nil {
+		t.Error("RouteRequests should not be nil")
+	}
+	if metrics.RateLimited == nil {
+		t.Error("RateLimited should not be nil")
+	}
+}
+
+func TestMemoryCacheEviction(t *testing.T) {
+	origTTL := config.CacheTTL
+	origPool := config.ConnectionPoolSize
+	config.CacheTTL = "1m"
+	config.ConnectionPoolSize = 0
+	t.Cleanup(func() {
+		config.CacheTTL = origTTL
+		config.ConnectionPoolSize = origPool
+	})
+
+	mc := &MemoryCache{
+		items:    make(map[string]cacheItem),
+		maxItems: 3,
+	}
+
+	// Fill cache to max
+	mc.Set("a", &pb.HTTPResponse{Status: 200, Body: "a"})
+	mc.Set("b", &pb.HTTPResponse{Status: 200, Body: "b"})
+	mc.Set("c", &pb.HTTPResponse{Status: 200, Body: "c"})
+
+	if mc.Size() != 3 {
+		t.Fatalf("expected 3 items, got %d", mc.Size())
+	}
+
+	// Adding one more should evict the one closest to expiry (all same TTL, so one removed)
+	mc.Set("d", &pb.HTTPResponse{Status: 200, Body: "d"})
+	if mc.Size() != 3 {
+		t.Errorf("expected 3 items after eviction, got %d", mc.Size())
+	}
+
+	// The new item should be present
+	if _, ok := mc.Get("d"); !ok {
+		t.Error("expected 'd' to be in cache")
+	}
+}
+
+func TestMemoryCacheEvictsExpiredFirst(t *testing.T) {
+	origTTL := config.CacheTTL
+	config.CacheTTL = "5ms"
+	t.Cleanup(func() { config.CacheTTL = origTTL })
+
+	mc := &MemoryCache{
+		items:    make(map[string]cacheItem),
+		maxItems: 2,
+	}
+
+	mc.Set("old", &pb.HTTPResponse{Status: 200, Body: "old"})
+	time.Sleep(10 * time.Millisecond)
+
+	// Change TTL for new items
+	config.CacheTTL = "1m"
+	mc.Set("fresh", &pb.HTTPResponse{Status: 200, Body: "fresh"})
+
+	// Cache is full (2 items), adding another should evict expired "old"
+	mc.Set("newest", &pb.HTTPResponse{Status: 200, Body: "newest"})
+
+	if _, ok := mc.Get("fresh"); !ok {
+		t.Error("expected 'fresh' to still be in cache")
+	}
+	if _, ok := mc.Get("newest"); !ok {
+		t.Error("expected 'newest' to be in cache")
+	}
+}
+
+func TestRateLimiterCleanup(t *testing.T) {
+	origEnabled := config.EnableRateLimit
+	config.EnableRateLimit = true
+	t.Cleanup(func() { config.EnableRateLimit = origEnabled })
+
+	rl := NewRateLimiter(100)
+
+	// Add some requests
+	rl.Allow("10.0.0.1")
+	rl.Allow("10.0.0.2")
+
+	rl.mu.Lock()
+	if len(rl.requests) != 2 {
+		t.Errorf("expected 2 IPs tracked, got %d", len(rl.requests))
+	}
+	rl.mu.Unlock()
+
+	// Wait for entries to expire
+	time.Sleep(1100 * time.Millisecond)
+
+	rl.Cleanup()
+
+	rl.mu.Lock()
+	if len(rl.requests) != 0 {
+		t.Errorf("expected 0 IPs after cleanup, got %d", len(rl.requests))
+	}
+	rl.mu.Unlock()
+}
+
+func TestGetCacheKeyDeterministic(t *testing.T) {
+	headers := map[string]string{"Accept": "text/html"}
+	key1 := getCacheKey("GET", "/page", headers, "body1")
+	key2 := getCacheKey("GET", "/page", headers, "body2")
+	if key1 == key2 {
+		t.Error("different body should produce different cache keys")
+	}
+}
+
+func TestLoadConfigDefaults(t *testing.T) {
+	// Save original config
+	origConfig := config
+
+	// Create a minimal temporary config
+	tmpFile, err := os.CreateTemp("", "harp-config-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	_, err = tmpFile.WriteString(`{
+		"grpcPort": ":50054",
+		"httpPort": ":8080",
+		"enableCache": false,
+		"allowedRegistration": []
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+
+	loadConfig(tmpFile.Name())
+
+	if config.MaxConcurrentRequests != 1000 {
+		t.Errorf("expected default MaxConcurrentRequests=1000, got %d", config.MaxConcurrentRequests)
+	}
+	if config.RequestTimeout != "30s" {
+		t.Errorf("expected default RequestTimeout='30s', got %q", config.RequestTimeout)
+	}
+	if config.MaxRequestBodySize != 10*1024*1024 {
+		t.Errorf("expected default MaxRequestBodySize=10MB, got %d", config.MaxRequestBodySize)
+	}
+	if config.GracefulShutdownDelay != "10s" {
+		t.Errorf("expected default GracefulShutdownDelay='10s', got %q", config.GracefulShutdownDelay)
+	}
+
+	// Restore config
+	config = origConfig
 }

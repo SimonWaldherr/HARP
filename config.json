@@ -33,5 +33,9 @@
   "maxHeaderSize": 8192,
   "readTimeout": "30s",
   "writeTimeout": "30s",
-  "idleTimeout": "120s"
+  "idleTimeout": "120s",
+  "maxRequestBodySize": 10485760,
+  "enableCORS": false,
+  "corsAllowedOrigins": "*",
+  "gracefulShutdownDelay": "10s"
 }
