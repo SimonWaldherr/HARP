@@ -369,8 +369,7 @@ func getCacheKey(method, url string, headers map[string]string, body string) str
 	h := sha256.New()
 	h.Write([]byte(method))
 	h.Write([]byte(url))
-	keys := maps.Keys(headers)
-	slices.Sort(keys)
+	keys := slices.Sorted(maps.Keys(headers))
 	for _, k := range keys {
 		v := headers[k]
 		h.Write([]byte(k))
