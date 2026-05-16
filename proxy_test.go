@@ -362,7 +362,9 @@ func TestCompiledAllowedRegistrationRules(t *testing.T) {
 	})
 
 	config.AllowedRegistration = []AllowedRegistrationRule{
+		{Route: "/.*$", Key: "secret"},
 		{Route: "/api/.*$", Key: "secret", Username: "operator", Password: "route-password"},
+		{Route: "/api/admin/.*$", Key: "secret", Username: "admin", Password: "admin-password"},
 	}
 	var err error
 	allowedRegistrationRules, err = compileAllowedRegistrationRules(config.AllowedRegistration)
@@ -376,8 +378,8 @@ func TestCompiledAllowedRegistrationRules(t *testing.T) {
 	if isRegistrationAllowed("/api/users", "wrong-key") {
 		t.Fatal("expected wrong key to be rejected")
 	}
-	if isRegistrationAllowed("/other", "secret") {
-		t.Fatal("expected non-matching route to be rejected")
+	if isRegistrationAllowed("/other", "wrong-key") {
+		t.Fatal("expected wrong key to be rejected for catch-all route")
 	}
 	rule, ok := allowedRegistrationFor("/api/users", "secret")
 	if !ok {
@@ -385,6 +387,20 @@ func TestCompiledAllowedRegistrationRules(t *testing.T) {
 	}
 	if rule.username != "operator" || rule.password != "route-password" {
 		t.Fatalf("unexpected route auth config: %#v", rule)
+	}
+	rule, ok = allowedRegistrationFor("/api/admin/users", "secret")
+	if !ok {
+		t.Fatal("expected admin matching rule to be returned")
+	}
+	if rule.username != "admin" || rule.password != "admin-password" {
+		t.Fatalf("expected most specific admin route auth config, got %#v", rule)
+	}
+	rule, ok = allowedRegistrationFor("/public", "secret")
+	if !ok {
+		t.Fatal("expected catch-all matching rule to be returned")
+	}
+	if rule.password != "" {
+		t.Fatalf("expected catch-all route to be unprotected, got %#v", rule)
 	}
 }
 

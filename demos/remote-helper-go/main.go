@@ -1,6 +1,6 @@
 // demos/remote-helper-go/main.go
 //
-// Remote Helper Demo
+// # Remote Helper Demo
 //
 // This demo shows how to use harpserver.RemoteHelper to create a lightweight
 // "remote helper" that runs on a home network (e.g. a MacBook) and exposes
@@ -8,8 +8,9 @@
 // publicly hosted HARP proxy.
 //
 // Architecture:
-//   Public server: HARP proxy  (listens on :8080 HTTP, :50054 gRPC)
-//   Home network : This helper (connects OUT to the proxy, no inbound ports needed)
+//
+//	Public server: HARP proxy  (listens on :8080 HTTP, :50054 gRPC)
+//	Home network : This helper (connects OUT to the proxy, no inbound ports needed)
 //
 // Usage:
 //
@@ -69,8 +70,8 @@ func main() {
 			"state":        "on",
 			"last_changed": time.Now().Add(-5 * time.Minute).Format(time.RFC3339),
 			"attributes": map[string]interface{}{
-				"brightness":  200,
-				"color_temp":  370,
+				"brightness":    200,
+				"color_temp":    370,
 				"friendly_name": strings.ReplaceAll(entity, "_", " "),
 			},
 		}

@@ -205,7 +205,7 @@ The `config.json` file controls the proxy behavior:
 ```
 
 When a backend registers, each route is checked against these rules. Only routes matching a rule regex with the correct key are accepted. Invalid regexes are caught at startup.
-Set `username` and `password` on a rule to require HTTP Basic Auth before client requests are forwarded to matching registered routes. The proxy strips the Basic Auth header after successful route authentication so route credentials are not sent to the backend.
+Set `username` and `password` on a rule to require HTTP Basic Auth before client requests are forwarded to matching registered routes. Leave `password` empty to keep that route open. If multiple rules match a registered route, the most specific rule wins, based on the longest route regex. This lets a catch-all registration coexist with route-specific passwords. The proxy strips the Basic Auth header after successful route authentication so route credentials are not sent to the backend.
 
 ---
 

@@ -92,6 +92,7 @@ type AllowedRegistrationRule struct {
 
 type compiledAllowedRegistrationRule struct {
 	pattern  *regexp.Regexp
+	route    string
 	key      string
 	username string
 	password string
@@ -754,11 +755,15 @@ func compileAllowedRegistrationRules(rules []AllowedRegistrationRule) ([]compile
 		}
 		compiled = append(compiled, compiledAllowedRegistrationRule{
 			pattern:  pattern,
+			route:    rule.Route,
 			key:      rule.Key,
 			username: rule.Username,
 			password: rule.Password,
 		})
 	}
+	slices.SortStableFunc(compiled, func(a, b compiledAllowedRegistrationRule) int {
+		return len(b.route) - len(a.route)
+	})
 	return compiled, nil
 }
 

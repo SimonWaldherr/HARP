@@ -14,7 +14,8 @@
   "diskCacheDir": "./cache",
   "cacheTTL": "30m",
   "allowedRegistration": [
-    { "route": "/.*$", "key": "master-key", "username": "demo", "password": "route-demo" }
+    { "route": "/.*$", "key": "master-key" },
+    { "route": "/test$", "key": "master-key", "username": "demo", "password": "route-demo" }
   ],
   "logLevel": "INFO",
   "maxConcurrentRequests": 1000,
