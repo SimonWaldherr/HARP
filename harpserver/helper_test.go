@@ -16,14 +16,14 @@ type stubProxyClient struct {
 	sent *pb.ClientMessage
 }
 
-func (s *stubProxyClient) Send(m *pb.ClientMessage) error         { s.sent = m; return nil }
-func (s *stubProxyClient) Recv() (*pb.ServerMessage, error)       { return nil, nil }
-func (s *stubProxyClient) CloseSend() error                       { return nil }
-func (s *stubProxyClient) Context() context.Context               { return context.Background() }
-func (s *stubProxyClient) SendMsg(m interface{}) error            { return nil }
-func (s *stubProxyClient) RecvMsg(m interface{}) error            { return nil }
-func (s *stubProxyClient) Header() (metadata.MD, error)           { return nil, nil }
-func (s *stubProxyClient) Trailer() metadata.MD                   { return nil }
+func (s *stubProxyClient) Send(m *pb.ClientMessage) error   { s.sent = m; return nil }
+func (s *stubProxyClient) Recv() (*pb.ServerMessage, error) { return nil, nil }
+func (s *stubProxyClient) CloseSend() error                 { return nil }
+func (s *stubProxyClient) Context() context.Context         { return context.Background() }
+func (s *stubProxyClient) SendMsg(m interface{}) error      { return nil }
+func (s *stubProxyClient) RecvMsg(m interface{}) error      { return nil }
+func (s *stubProxyClient) Header() (metadata.MD, error)     { return nil, nil }
+func (s *stubProxyClient) Trailer() metadata.MD             { return nil }
 
 // TestHelperHandlerFuncSignature verifies that HelperHandlerFunc can be used
 // with the expected signature.
@@ -76,12 +76,16 @@ func TestRemoteHelperRegister(t *testing.T) {
 func TestRemoteHelperHandleRequest(t *testing.T) {
 	h := &RemoteHelper{Name: "dispatch-test"}
 
-	routeMap := map[string]HelperHandlerFunc{
-		"/api": func(r *http.Request) (int, map[string]string, string) {
-			return 200, map[string]string{"X-From": "api"}, "api-response"
+	routeMap := map[string]HelperRoute{
+		"/api": {
+			Handler: func(r *http.Request) (int, map[string]string, string) {
+				return 200, map[string]string{"X-From": "api"}, "api-response"
+			},
 		},
-		"/other": func(r *http.Request) (int, map[string]string, string) {
-			return 201, nil, "other"
+		"/other": {
+			Handler: func(r *http.Request) (int, map[string]string, string) {
+				return 201, nil, "other"
+			},
 		},
 	}
 
@@ -106,7 +110,7 @@ func TestRemoteHelperHandleRequest(t *testing.T) {
 			}
 
 			stub := &stubProxyClient{}
-			h.handleRequest(stub, reqProto, routeMap)
+			h.handleRequest(stub, reqProto, routeMap, nil)
 
 			if stub.sent == nil {
 				t.Fatal("expected a response to be sent")
@@ -125,6 +129,24 @@ func TestRemoteHelperHandleRequest(t *testing.T) {
 				t.Errorf("path %s: RequestId mismatch: got %s, want %s", tc.path, resp.RequestId, reqProto.RequestId)
 			}
 		})
+	}
+}
+
+func TestRemoteHelperRegisterStream(t *testing.T) {
+	h := &RemoteHelper{Name: "stream-test"}
+
+	h.RegisterStream("/stream", "Stream", func(
+		r *http.Request,
+		send func(statusCode int, headers map[string]string, body string, end bool) error,
+	) error {
+		return send(http.StatusOK, map[string]string{"Content-Type": "text/plain"}, "chunk", true)
+	})
+
+	if len(h.Routes) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(h.Routes))
+	}
+	if h.Routes[0].StreamHandler == nil {
+		t.Fatal("expected StreamHandler to be set")
 	}
 }
 

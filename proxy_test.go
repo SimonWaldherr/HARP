@@ -246,6 +246,20 @@ func TestGetCacheKeyDeterministic(t *testing.T) {
 	if key1 == key2 {
 		t.Error("different body should produce different cache keys")
 	}
+
+	headersA := map[string]string{
+		"Accept":       "text/html",
+		"Content-Type": "application/json",
+	}
+	headersB := map[string]string{
+		"Content-Type": "application/json",
+		"Accept":       "text/html",
+	}
+	cacheKeyA := getCacheKey("GET", "/page", headersA, "body")
+	cacheKeyB := getCacheKey("GET", "/page", headersB, "body")
+	if cacheKeyA != cacheKeyB {
+		t.Errorf("header map insertion order should not affect cache key: %s != %s", cacheKeyA, cacheKeyB)
+	}
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
@@ -287,4 +301,49 @@ func TestLoadConfigDefaults(t *testing.T) {
 
 	// Restore config
 	config = origConfig
+}
+
+func TestHeaderEnabled(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    bool
+	}{
+		{"one", map[string]string{"X-Test": "1"}, true},
+		{"true", map[string]string{"X-Test": "true"}, true},
+		{"yes", map[string]string{"X-Test": "yes"}, true},
+		{"false", map[string]string{"X-Test": "false"}, false},
+		{"missing", map[string]string{}, false},
+	}
+	for _, tc := range tests {
+		if got := headerEnabled(tc.headers, "X-Test"); got != tc.want {
+			t.Errorf("%s: expected %v, got %v", tc.name, tc.want, got)
+		}
+	}
+}
+
+func TestFilterInternalHeaders(t *testing.T) {
+	headers := map[string]string{
+		"Content-Type":      "text/event-stream",
+		pb.StreamHeader:     "1",
+		pb.StreamEndHeader:  "1",
+		"X-Another-Header":  "ok",
+		"x-harp-stream-end": "1",
+	}
+	filtered := filterInternalHeaders(headers)
+	if filtered["Content-Type"] != "text/event-stream" {
+		t.Fatalf("expected Content-Type to be preserved")
+	}
+	if filtered["X-Another-Header"] != "ok" {
+		t.Fatalf("expected custom header to be preserved")
+	}
+	if _, ok := filtered[pb.StreamHeader]; ok {
+		t.Fatalf("expected %s to be removed", pb.StreamHeader)
+	}
+	if _, ok := filtered[pb.StreamEndHeader]; ok {
+		t.Fatalf("expected %s to be removed", pb.StreamEndHeader)
+	}
+	if _, ok := filtered["x-harp-stream-end"]; ok {
+		t.Fatalf("expected case-insensitive stream-end header to be removed")
+	}
 }

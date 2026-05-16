@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -20,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -184,7 +186,7 @@ func (mc *MemoryCache) Set(key string, resp *pb.HTTPResponse) {
 				first = false
 			}
 		}
-		if first == false && oldestKey != "" && len(mc.items) >= mc.maxItems {
+		if !first && oldestKey != "" && len(mc.items) >= mc.maxItems {
 			delete(mc.items, oldestKey)
 		}
 	}
@@ -367,7 +369,9 @@ func getCacheKey(method, url string, headers map[string]string, body string) str
 	h := sha256.New()
 	h.Write([]byte(method))
 	h.Write([]byte(url))
-	for k, v := range headers {
+	keys := slices.Sorted(maps.Keys(headers))
+	for _, k := range keys {
+		v := headers[k]
 		h.Write([]byte(k))
 		h.Write([]byte(v))
 	}
@@ -397,6 +401,13 @@ var (
 	pendingMu       sync.RWMutex
 	pendingResponse = make(map[string]chan *pb.HTTPResponse)
 	startTime       time.Time
+	requestSem      chan struct{}
+)
+
+const (
+	// Small burst buffer for streamed chunks to reduce head-of-line blocking
+	// on backend receive loops while keeping per-request memory bounded.
+	responseChannelBufferSize = 8
 )
 
 // Health check endpoint
@@ -549,6 +560,16 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 
 // --- HTTP Handler for Client Requests ---
 func httpHandler(w http.ResponseWriter, r *http.Request) {
+	if requestSem != nil {
+		select {
+		case requestSem <- struct{}{}:
+			defer func() { <-requestSem }()
+		default:
+			http.Error(w, "Server busy", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	start := time.Now()
 	defer func() {
 		duration := time.Since(start)
@@ -658,10 +679,15 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Prepare channel for response.
-	respCh := make(chan *pb.HTTPResponse, 1)
+	respCh := make(chan *pb.HTTPResponse, responseChannelBufferSize)
 	pendingMu.Lock()
 	pendingResponse[reqID] = respCh
 	pendingMu.Unlock()
+	defer func() {
+		pendingMu.Lock()
+		delete(pendingResponse, reqID)
+		pendingMu.Unlock()
+	}()
 
 	// Send the HTTPRequest to the chosen backend.
 	serverMsg := &pb.ServerMessage{HttpRequest: httpReq}
@@ -685,24 +711,73 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 			timeout = parsedTimeout
 		}
 	}
+	flusher, canFlush := w.(http.Flusher)
 
 	select {
 	case resp := <-respCh:
-		for k, v := range resp.Headers {
-			w.Header().Set(k, v)
-		}
-		w.WriteHeader(int(resp.Status))
-		fmt.Fprint(w, resp.Body)
-		if config.EnableCache && strings.ToUpper(r.Method) == "GET" && config.CacheType != "none" {
-			cacheStore.Set(cacheKey, resp)
+		isStream := headerEnabled(resp.Headers, pb.StreamHeader)
+		firstStatus := int(resp.Status)
+		firstHeaders := filterInternalHeaders(resp.Headers)
+		var bodyBuilder strings.Builder
+		wroteHeaders := false
+		for {
+			if !wroteHeaders {
+				for k, v := range firstHeaders {
+					w.Header().Set(k, v)
+				}
+				w.WriteHeader(firstStatus)
+				wroteHeaders = true
+			}
+
+			if resp.Body != "" {
+				fmt.Fprint(w, resp.Body)
+				if !isStream {
+					bodyBuilder.WriteString(resp.Body)
+				}
+				if isStream && canFlush {
+					flusher.Flush()
+				}
+			}
+
+			if !isStream || headerEnabled(resp.Headers, pb.StreamEndHeader) {
+				if config.EnableCache && strings.ToUpper(r.Method) == "GET" && config.CacheType != "none" && !isStream {
+					cacheStore.Set(cacheKey, &pb.HTTPResponse{
+						Status:  int32(firstStatus),
+						Headers: firstHeaders,
+						Body:    bodyBuilder.String(),
+					})
+				}
+				return
+			}
+
+			select {
+			case resp = <-respCh:
+			case <-time.After(timeout):
+				metrics.BackendErrors.Add(1)
+				logWarn("Stream timeout for request %s", reqID)
+				return
+			}
 		}
 	case <-time.After(timeout):
 		http.Error(w, "Timeout waiting for backend", http.StatusGatewayTimeout)
 		metrics.BackendErrors.Add(1)
 	}
-	pendingMu.Lock()
-	delete(pendingResponse, reqID)
-	pendingMu.Unlock()
+}
+
+func headerEnabled(headers map[string]string, key string) bool {
+	val := strings.TrimSpace(strings.ToLower(headers[key]))
+	return val == "1" || val == "true" || val == "yes"
+}
+
+func filterInternalHeaders(headers map[string]string) map[string]string {
+	out := make(map[string]string, len(headers))
+	for k, v := range headers {
+		if strings.EqualFold(k, pb.StreamHeader) || strings.EqualFold(k, pb.StreamEndHeader) {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // --- Server Starters ---
@@ -945,6 +1020,9 @@ func main() {
 	startTime = time.Now()
 	loadConfig(*configPath)
 	logInfo("Enhanced HARP proxy starting with configuration: %s", *configPath)
+	if config.MaxConcurrentRequests > 0 {
+		requestSem = make(chan struct{}, config.MaxConcurrentRequests)
+	}
 
 	// Always initialize metrics (used in httpHandler unconditionally)
 	initMetrics()

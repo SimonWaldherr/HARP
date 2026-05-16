@@ -252,6 +252,10 @@ The **demos/** folder includes several backend examples:
    (Home Assistant state, local commands) to a public HARP proxy without
    requiring any inbound firewall rules.
 
+6. **LLM Gateway Demo (demos/llm-gateway):**  
+   Exposes local Ollama / LM Studio / llmster endpoints through your public
+   HARP proxy (on any public host) using `harp-gateway` JSON config only.
+
 ---
 
 ## Using the Web Handler Wrapper
@@ -331,12 +335,16 @@ make build-gateway
   "key": "master-key",
   "domain": ".*",
   "reconnectInterval": "5s",
+  "upstreamMaxIdleConns": 200,
+  "upstreamMaxIdleConnsPerHost": 100,
+  "upstreamMaxConnsPerHost": 0,
   "services": [
     {
       "name": "Home Assistant",
       "route": "/homeassistant/",
       "upstream": "http://localhost:8123",
       "stripPrefix": true,
+      "streaming": true,
       "addHeaders": {
         "Authorization": "Bearer YOUR_HA_TOKEN"
       },
@@ -366,6 +374,7 @@ make build-gateway
 | `route` | string | *required* | Public path prefix registered with the proxy |
 | `upstream` | string | *required* | Local HTTP base URL to forward requests to |
 | `stripPrefix` | bool | `false` | Remove the route prefix before forwarding (e.g. `/pihole/admin/index` → `/admin/index`) |
+| `streaming` | bool | `false` | Enable chunked streaming relay for long-lived responses (SSE/token streams) |
 | `addHeaders` | object | `{}` | Extra headers injected into every upstream request (auth tokens, API keys, …) |
 | `timeoutSeconds` | int | `30` | Per-request timeout for the upstream call |
 
@@ -379,6 +388,7 @@ make build-gateway
 Auto-reconnect is built in — if the connection to the proxy drops, the gateway retries every `reconnectInterval`.
 
 See [cmd/harp-gateway/gateway-example.json](cmd/harp-gateway/gateway-example.json) for the full example config.
+For a ready-to-use home-LLM setup, see [demos/llm-gateway](demos/llm-gateway/).
 
 ---
 

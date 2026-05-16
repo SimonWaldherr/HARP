@@ -1,0 +1,36 @@
+{
+  "name": "home-llm-gateway",
+  "proxyURL": "YOUR_PUBLIC_PROXY_HOST:50054",
+  "upstreamMaxIdleConns": 200,
+  "upstreamMaxIdleConnsPerHost": 100,
+  "upstreamMaxConnsPerHost": 0,
+  "key": "master-key",
+  "domain": ".*",
+  "reconnectInterval": "5s",
+  "services": [
+    {
+      "name": "Ollama",
+      "route": "/llm/ollama/",
+      "upstream": "http://127.0.0.1:11434",
+      "stripPrefix": true,
+      "streaming": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "name": "LM Studio",
+      "route": "/llm/lmstudio/",
+      "upstream": "http://127.0.0.1:1234",
+      "stripPrefix": true,
+      "streaming": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "name": "llmster",
+      "route": "/llm/llmster/",
+      "upstream": "http://127.0.0.1:8000",
+      "stripPrefix": true,
+      "streaming": true,
+      "timeoutSeconds": 120
+    }
+  ]
+}
