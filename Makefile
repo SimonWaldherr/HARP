@@ -146,13 +146,13 @@ demo-admin: build-proxy ## Run proxy + backend with the admin UI enabled
 	sleep 1; \
 	echo ""; \
 	echo "=== Sending proxied request ==="; \
-	curl -s http://localhost:8080/test || true; \
+	curl -s -u demo:route-demo http://localhost:8080/test || true; \
 	echo ""; \
 	echo ""; \
 	echo "=== Admin API ==="; \
-	curl -s http://localhost:8080/admin/api/status | python3 -m json.tool 2>/dev/null || curl -s http://localhost:8080/admin/api/status; \
+	curl -s -u admin:admin-demo http://localhost:8080/admin/api/status | python3 -m json.tool 2>/dev/null || curl -s -u admin:admin-demo http://localhost:8080/admin/api/status; \
 	echo ""; \
-	echo "Admin UI: http://localhost:8080/admin"; \
+	echo "Admin UI: http://localhost:8080/admin (admin/admin-demo)"; \
 	echo "=== Cleaning up ==="; \
 	kill $$DEMO_PID 2>/dev/null; \
 	kill $$PROXY_PID 2>/dev/null; \

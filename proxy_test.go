@@ -362,7 +362,7 @@ func TestCompiledAllowedRegistrationRules(t *testing.T) {
 	})
 
 	config.AllowedRegistration = []AllowedRegistrationRule{
-		{Route: "/api/.*$", Key: "secret"},
+		{Route: "/api/.*$", Key: "secret", Username: "operator", Password: "route-password"},
 	}
 	var err error
 	allowedRegistrationRules, err = compileAllowedRegistrationRules(config.AllowedRegistration)
@@ -378,6 +378,13 @@ func TestCompiledAllowedRegistrationRules(t *testing.T) {
 	}
 	if isRegistrationAllowed("/other", "secret") {
 		t.Fatal("expected non-matching route to be rejected")
+	}
+	rule, ok := allowedRegistrationFor("/api/users", "secret")
+	if !ok {
+		t.Fatal("expected matching rule to be returned")
+	}
+	if rule.username != "operator" || rule.password != "route-password" {
+		t.Fatalf("unexpected route auth config: %#v", rule)
 	}
 }
 
@@ -484,6 +491,32 @@ func TestAdminHandlersRespectConfig(t *testing.T) {
 	}
 }
 
+func TestAdminHandlersRequireConfiguredPassword(t *testing.T) {
+	origConfig := config
+	t.Cleanup(func() { config = origConfig })
+
+	config.EnableAdminUI = true
+	config.AdminPath = "/admin"
+	config.AdminPassword = "secret"
+	mux := http.NewServeMux()
+	registerAdminHandlers(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthenticated admin request to return 401, got %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.SetBasicAuth("admin", "secret")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected authenticated admin request to return 200, got %d", rec.Code)
+	}
+}
+
 func TestAdminStatusHandler(t *testing.T) {
 	origConfig := config
 	origMetrics := metrics
@@ -564,10 +597,12 @@ func TestMatchBackendUsesHostAndPath(t *testing.T) {
 	backendsMu.Lock()
 	exampleBackend := &backendConn{
 		routes: []registeredRoute{{
-			name:    "example",
-			domain:  `example\.com`,
-			path:    "/api",
-			pattern: regexp.MustCompile(`example\.com/api`),
+			name:     "example",
+			domain:   `example\.com`,
+			path:     "/api",
+			pattern:  regexp.MustCompile(`example\.com/api`),
+			username: "operator",
+			password: "route-password",
 		}},
 	}
 	otherBackend := &backendConn{
@@ -589,15 +624,18 @@ func TestMatchBackendUsesHostAndPath(t *testing.T) {
 		backendsMu.Unlock()
 	})
 
-	got, route := matchBackend("example.com", "/api/users")
+	got, route, auth := matchBackend("example.com", "/api/users")
 	if got != exampleBackend {
 		t.Fatalf("expected example.com backend, got %#v", got)
 	}
 	if route != "/api" {
 		t.Fatalf("expected matched route /api, got %q", route)
 	}
+	if auth.username != "operator" || auth.password != "route-password" {
+		t.Fatalf("unexpected route auth config: %#v", auth)
+	}
 
-	got, route = matchBackend("example.com:8080", "/api/users")
+	got, route, _ = matchBackend("example.com:8080", "/api/users")
 	if got != exampleBackend {
 		t.Fatalf("expected example.com backend when Host includes a port, got %#v", got)
 	}
@@ -605,8 +643,26 @@ func TestMatchBackendUsesHostAndPath(t *testing.T) {
 		t.Fatalf("expected matched route /api with Host port, got %q", route)
 	}
 
-	got, route = matchBackend("missing.example", "/api/users")
+	got, route, _ = matchBackend("missing.example", "/api/users")
 	if got != nil || route != "" {
 		t.Fatalf("expected no backend for unmatched host, got %#v route %q", got, route)
+	}
+}
+
+func TestRequireBasicAuth(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	if requireBasicAuth(rec, req, "user", "password", "Test Realm") {
+		t.Fatal("expected missing credentials to fail")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.SetBasicAuth("user", "password")
+	if !requireBasicAuth(rec, req, "user", "password", "Test Realm") {
+		t.Fatal("expected valid credentials to pass")
 	}
 }

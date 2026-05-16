@@ -39,5 +39,7 @@
   "corsAllowedOrigins": "*",
   "gracefulShutdownDelay": "10s",
   "enableAdminUI": false,
-  "adminPath": "/admin"
+  "adminPath": "/admin",
+  "adminUsername": "admin",
+  "adminPassword": ""
 }

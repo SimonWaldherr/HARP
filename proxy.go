@@ -4,7 +4,9 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -77,16 +79,22 @@ type Config struct {
 	GracefulShutdownDelay string `json:"gracefulShutdownDelay"`
 	EnableAdminUI         bool   `json:"enableAdminUI"`
 	AdminPath             string `json:"adminPath"`
+	AdminUsername         string `json:"adminUsername"`
+	AdminPassword         string `json:"adminPassword"`
 }
 
 type AllowedRegistrationRule struct {
-	Route string `json:"route"`
-	Key   string `json:"key"`
+	Route    string `json:"route"`
+	Key      string `json:"key"`
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 type compiledAllowedRegistrationRule struct {
-	pattern *regexp.Regexp
-	key     string
+	pattern  *regexp.Regexp
+	key      string
+	username string
+	password string
 }
 
 // Metrics structure for monitoring
@@ -420,16 +428,19 @@ type backendConn struct {
 }
 
 type registeredRoute struct {
-	name    string
-	pattern *regexp.Regexp
-	domain  string
-	path    string
+	name     string
+	pattern  *regexp.Regexp
+	domain   string
+	path     string
+	username string
+	password string
 }
 
 type routeSnapshot struct {
-	Name   string `json:"name"`
-	Domain string `json:"domain"`
-	Path   string `json:"path"`
+	Name      string `json:"name"`
+	Domain    string `json:"domain"`
+	Path      string `json:"path"`
+	Protected bool   `json:"protected"`
 }
 
 var (
@@ -480,9 +491,10 @@ func registeredRoutesSnapshot() []routeSnapshot {
 			}
 			seen[key] = struct{}{}
 			routes = append(routes, routeSnapshot{
-				Name:   route.name,
-				Domain: route.domain,
-				Path:   route.path,
+				Name:      route.name,
+				Domain:    route.domain,
+				Path:      route.path,
+				Protected: route.password != "",
 			})
 		}
 	}
@@ -529,6 +541,9 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func adminStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireBasicAuth(w, r, adminUsername(), config.AdminPassword, "HARP Admin") {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 
 	var cacheSize int
@@ -566,6 +581,9 @@ func adminStatusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func adminUIHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireBasicAuth(w, r, adminUsername(), config.AdminPassword, "HARP Admin") {
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, adminHTML(adminPath()))
 }
@@ -589,6 +607,13 @@ func adminPath() string {
 	return path
 }
 
+func adminUsername() string {
+	if config.AdminUsername == "" {
+		return "admin"
+	}
+	return config.AdminUsername
+}
+
 func registerAdminHandlers(mux *http.ServeMux) {
 	if !config.EnableAdminUI {
 		return
@@ -599,193 +624,8 @@ func registerAdminHandlers(mux *http.ServeMux) {
 	mux.HandleFunc(path+"/api/status", adminStatusHandler)
 }
 
-const adminHTMLTemplate = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HARP Admin</title>
-<style>
-:root {
-  --bg: #f4f1ea;
-  --ink: #18201c;
-  --muted: #69746e;
-  --line: #d9d3c6;
-  --panel: #fffdf8;
-  --accent: #0d7c66;
-  --accent-2: #c46f28;
-  --warn: #a8342f;
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  color: var(--ink);
-  background:
-    radial-gradient(circle at 20% 0%, rgba(13, 124, 102, .16), transparent 28rem),
-    linear-gradient(135deg, #f7f2e8 0%, #eef3ee 52%, #f6eee2 100%);
-  font: 15px/1.45 ui-sans-serif, "Avenir Next", "Segoe UI", sans-serif;
-}
-main { width: min(1180px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 42px; }
-header {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 18px;
-  align-items: end;
-  padding: 22px 0 26px;
-}
-h1 { margin: 0; font-size: clamp(36px, 7vw, 76px); line-height: .9; letter-spacing: 0; }
-.subline { margin-top: 12px; color: var(--muted); max-width: 720px; }
-.status-pill {
-  display: inline-flex;
-  gap: 8px;
-  align-items: center;
-  min-height: 34px;
-  padding: 7px 12px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(255,255,255,.72);
-  font-weight: 700;
-}
-.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 5px rgba(13,124,102,.12); }
-.grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
-.panel {
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: rgba(255,253,248,.86);
-  box-shadow: 0 18px 45px rgba(24,32,28,.08);
-  overflow: hidden;
-}
-.span-3 { grid-column: span 3; }
-.span-4 { grid-column: span 4; }
-.span-8 { grid-column: span 8; }
-.span-12 { grid-column: span 12; }
-.metric { padding: 18px; min-height: 124px; display: flex; flex-direction: column; justify-content: space-between; }
-.label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
-.value { font-size: 34px; font-weight: 800; letter-spacing: 0; margin-top: 14px; }
-.panel h2 { margin: 0; padding: 16px 18px; border-bottom: 1px solid var(--line); font-size: 16px; letter-spacing: 0; }
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 12px 18px; border-bottom: 1px solid var(--line); vertical-align: top; }
-th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
-tr:last-child td { border-bottom: 0; }
-code { font-family: "SF Mono", Consolas, monospace; font-size: 13px; overflow-wrap: anywhere; }
-.runtime { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 18px; }
-.runtime div { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fffaf1; }
-.runtime strong { display: block; font-size: 22px; margin-bottom: 4px; }
-.toolbar { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-top: 1px solid var(--line); color: var(--muted); }
-button {
-  border: 1px solid #0b5f4f;
-  border-radius: 8px;
-  background: var(--accent);
-  color: white;
-  padding: 9px 13px;
-  font-weight: 800;
-  cursor: pointer;
-}
-.empty, .error { padding: 18px; color: var(--muted); }
-.error { color: var(--warn); }
-@media (max-width: 820px) {
-  header { grid-template-columns: 1fr; }
-  .span-3, .span-4, .span-8 { grid-column: span 12; }
-  .runtime { grid-template-columns: 1fr; }
-}
-</style>
-</head>
-<body>
-<main>
-  <header>
-    <div>
-      <h1>HARP Admin</h1>
-      <div class="subline">Live proxy state, backend routes, runtime pressure, and request counters.</div>
-    </div>
-    <div class="status-pill"><span class="dot"></span><span id="status">loading</span></div>
-  </header>
-
-  <section class="grid" aria-live="polite">
-    <article class="panel metric span-3"><div class="label">Backends</div><div class="value" id="backends">0</div></article>
-    <article class="panel metric span-3"><div class="label">Requests</div><div class="value" id="requests">0</div></article>
-    <article class="panel metric span-3"><div class="label">Cache hits</div><div class="value" id="hits">0</div></article>
-    <article class="panel metric span-3"><div class="label">Errors</div><div class="value" id="errors">0</div></article>
-
-    <article class="panel span-8">
-      <h2>Routes</h2>
-      <table>
-        <thead><tr><th>Name</th><th>Domain</th><th>Path</th></tr></thead>
-        <tbody id="routes"><tr><td colspan="3" class="empty">No routes registered</td></tr></tbody>
-      </table>
-    </article>
-
-    <article class="panel span-4">
-      <h2>Runtime</h2>
-      <div class="runtime" id="runtime"></div>
-      <div class="toolbar"><span id="updated">Waiting for data</span><button id="refresh">Refresh</button></div>
-    </article>
-  </section>
-</main>
-<script>
-const api = "__ADMIN_API__";
-const $ = (id) => document.getElementById(id);
-const fmt = (v) => Number(v || 0).toLocaleString();
-
-function metricKey(data, suffix) {
-  const metrics = data.runtimeScheduler || {};
-  return metrics[suffix] || 0;
-}
-
-function render(data) {
-  $("status").textContent = data.status || "unknown";
-  $("backends").textContent = fmt(data.counters && data.counters.activeConnections);
-  $("requests").textContent = fmt(data.counters && data.counters.requestsTotal);
-  $("hits").textContent = fmt(data.counters && data.counters.cacheHits);
-  $("errors").textContent = fmt(data.counters && data.counters.backendErrors);
-
-  const routes = data.routes || [];
-  $("routes").innerHTML = routes.length ? routes.map((route) =>
-    "<tr>" +
-    "<td>" + escapeHTML(route.name || "unnamed") + "</td>" +
-    "<td><code>" + escapeHTML(route.domain || "") + "</code></td>" +
-    "<td><code>" + escapeHTML(route.path || "") + "</code></td>" +
-    "</tr>"
-  ).join("") : "<tr><td colspan=\"3\" class=\"empty\">No routes registered</td></tr>";
-
-  const runtime = [
-    ["Goroutines", "/sched/goroutines:goroutines"],
-    ["Runnable", "/sched/goroutines/runnable:goroutines"],
-    ["Waiting", "/sched/goroutines/waiting:goroutines"],
-    ["Threads", "/sched/threads/total:threads"]
-  ];
-  $("runtime").innerHTML = runtime.map(([label, key]) =>
-    "<div><strong>" + fmt(metricKey(data, key)) + "</strong><span class=\"label\">" + label + "</span></div>"
-  ).join("");
-  $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
-}
-
-function escapeHTML(value) {
-  return String(value).replace(/[&<>"']/g, (char) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;"
-  }[char]));
-}
-
-async function load() {
-  try {
-    const res = await fetch(api, { cache: "no-store" });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    render(await res.json());
-  } catch (err) {
-    $("status").textContent = "error";
-    $("routes").innerHTML = "<tr><td colspan=\"3\" class=\"error\">" + escapeHTML(err.message) + "</td></tr>";
-  }
-}
-
-$("refresh").addEventListener("click", load);
-load();
-setInterval(load, 5000);
-</script>
-</body>
-</html>`
+//go:embed admin.html
+var adminHTMLTemplate string
 
 func runtimeMetricSnapshot(names []string) map[string]uint64 {
 	samples := make([]runtimemetrics.Sample, len(names))
@@ -823,7 +663,7 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 	// Check each route against allowedRegistration rules.
 	allowedRoutes := []*pb.Route{}
 	for _, r := range reg.Routes {
-		if isRegistrationAllowed(r.Path, reg.Key) {
+		if _, ok := allowedRegistrationFor(r.Path, reg.Key); ok {
 			allowedRoutes = append(allowedRoutes, r)
 		}
 	}
@@ -847,11 +687,14 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 			logError("Error compiling regexp for route %s: %v", r.Path, err)
 			continue
 		}
+		authRule, _ := allowedRegistrationFor(r.Path, reg.Key)
 		conn.routes = append(conn.routes, registeredRoute{
-			name:    r.Name,
-			pattern: pattern,
-			domain:  routeDomain,
-			path:    r.Path,
+			name:     r.Name,
+			pattern:  pattern,
+			domain:   routeDomain,
+			path:     r.Path,
+			username: authRule.username,
+			password: authRule.password,
 		})
 		backendsMu.Lock()
 		backends[backendKey(routeDomain, r.Path)] = conn
@@ -910,29 +753,36 @@ func compileAllowedRegistrationRules(rules []AllowedRegistrationRule) ([]compile
 			return nil, fmt.Errorf("invalid regex in allowedRegistration route %q: %w", rule.Route, err)
 		}
 		compiled = append(compiled, compiledAllowedRegistrationRule{
-			pattern: pattern,
-			key:     rule.Key,
+			pattern:  pattern,
+			key:      rule.Key,
+			username: rule.Username,
+			password: rule.Password,
 		})
 	}
 	return compiled, nil
 }
 
-func isRegistrationAllowed(path, key string) bool {
+func allowedRegistrationFor(path, key string) (compiledAllowedRegistrationRule, bool) {
 	rules := allowedRegistrationRules
 	if len(rules) == 0 && len(config.AllowedRegistration) > 0 {
 		var err error
 		rules, err = compileAllowedRegistrationRules(config.AllowedRegistration)
 		if err != nil {
 			logError("Error compiling allowed registration rules: %v", err)
-			return false
+			return compiledAllowedRegistrationRule{}, false
 		}
 	}
 	for _, rule := range rules {
 		if key == rule.key && rule.pattern.MatchString(path) {
-			return true
+			return rule, true
 		}
 	}
-	return false
+	return compiledAllowedRegistrationRule{}, false
+}
+
+func isRegistrationAllowed(path, key string) bool {
+	_, ok := allowedRegistrationFor(path, key)
+	return ok
 }
 
 func deliverPendingResponse(ctx context.Context, resp *pb.HTTPResponse, ch chan<- *pb.HTTPResponse) bool {
@@ -993,6 +843,27 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Find the best matching backend (longest path wins).
+	chosen, matchedRoute, routeAuth := matchBackend(r.Host, r.URL.Path)
+
+	if matchedRoute != "" {
+		metrics.RouteRequests.Add(matchedRoute, 1)
+	}
+
+	if chosen == nil {
+		logWarn("No matching route for %s", r.URL.String())
+		http.NotFound(w, r)
+		return
+	}
+
+	authenticatedRoute := false
+	if routeAuth.password != "" {
+		if !requireBasicAuth(w, r, routeAuth.username, routeAuth.password, "HARP Route") {
+			return
+		}
+		authenticatedRoute = true
+	}
+
 	// Enforce request body size limit
 	var bodyReader io.Reader = r.Body
 	if config.MaxRequestBodySize > 0 {
@@ -1018,6 +889,9 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 			headers[k] = v[0]
 		}
 	}
+	if authenticatedRoute {
+		delete(headers, "Authorization")
+	}
 
 	cacheKey := getCacheKey(r.Method, r.URL.String(), headers, bodyStr)
 	if config.EnableCache && strings.ToUpper(r.Method) == "GET" && config.CacheType != "none" {
@@ -1042,19 +916,6 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		Body:      bodyStr,
 		RequestId: reqID,
 		Timestamp: time.Now().UnixNano(),
-	}
-
-	// Find the best matching backend (longest path wins).
-	chosen, matchedRoute := matchBackend(r.Host, r.URL.Path)
-
-	if matchedRoute != "" {
-		metrics.RouteRequests.Add(matchedRoute, 1)
-	}
-
-	if chosen == nil {
-		logWarn("No matching route for %s", r.URL.String())
-		http.NotFound(w, r)
-		return
 	}
 
 	// Prepare channel for response.
@@ -1143,9 +1004,15 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func matchBackend(host, path string) (*backendConn, string) {
+type routeAuthConfig struct {
+	username string
+	password string
+}
+
+func matchBackend(host, path string) (*backendConn, string, routeAuthConfig) {
 	var chosen *backendConn
 	var matchedRoute string
+	var auth routeAuthConfig
 	var bestLen int
 	requestRoute := routeTarget(host, path)
 
@@ -1156,11 +1023,15 @@ func matchBackend(host, path string) (*backendConn, string) {
 			if route.pattern.MatchString(requestRoute) && len(route.path) > bestLen {
 				chosen = conn
 				matchedRoute = route.path
+				auth = routeAuthConfig{
+					username: route.username,
+					password: route.password,
+				}
 				bestLen = len(route.path)
 			}
 		}
 	}
-	return chosen, matchedRoute
+	return chosen, matchedRoute, auth
 }
 
 func routeTarget(host, path string) string {
@@ -1176,6 +1047,28 @@ func clientIPFromRemoteAddr(remoteAddr string) string {
 		return remoteAddr
 	}
 	return host
+}
+
+func requireBasicAuth(w http.ResponseWriter, r *http.Request, username, password, realm string) bool {
+	if password == "" {
+		return true
+	}
+	if username == "" {
+		username = "harp"
+	}
+	gotUser, gotPassword, ok := r.BasicAuth()
+	if ok && secureCompare(gotUser, username) && secureCompare(gotPassword, password) {
+		return true
+	}
+	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm=%q, charset="UTF-8"`, realm))
+	http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	return false
+}
+
+func secureCompare(got, want string) bool {
+	gotHash := sha256.Sum256([]byte(got))
+	wantHash := sha256.Sum256([]byte(want))
+	return subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1
 }
 
 func headerEnabled(headers map[string]string, key string) bool {

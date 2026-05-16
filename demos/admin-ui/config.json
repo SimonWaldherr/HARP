@@ -14,7 +14,7 @@
   "diskCacheDir": "./cache",
   "cacheTTL": "30m",
   "allowedRegistration": [
-    { "route": "/.*$", "key": "master-key" }
+    { "route": "/.*$", "key": "master-key", "username": "demo", "password": "route-demo" }
   ],
   "logLevel": "INFO",
   "maxConcurrentRequests": 1000,
@@ -36,5 +36,7 @@
   "corsAllowedOrigins": "*",
   "gracefulShutdownDelay": "10s",
   "enableAdminUI": true,
-  "adminPath": "/admin"
+  "adminPath": "/admin",
+  "adminUsername": "admin",
+  "adminPassword": "admin-demo"
 }

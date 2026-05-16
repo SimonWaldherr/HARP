@@ -181,6 +181,8 @@ The `config.json` file controls the proxy behavior:
 | `corsAllowedOrigins` | string | `*` | Allowed CORS origins |
 | `enableAdminUI` | bool | `false` | Enable the built-in web admin dashboard |
 | `adminPath` | string | `/admin` | Admin dashboard path when enabled |
+| `adminUsername` | string | `admin` | Admin dashboard Basic Auth username |
+| `adminPassword` | string | empty | Admin dashboard Basic Auth password; empty disables admin auth |
 | `enableHealthCheck` | bool | `true` | Enable `/health` endpoint |
 | `enableMetrics` | bool | `true` | Enable `/metrics` + pprof |
 | `metricsPort` | string | `:9091` | Metrics server listen address |
@@ -196,13 +198,14 @@ The `config.json` file controls the proxy behavior:
 
 ```json
 "allowedRegistration": [
-  { "route": "/foobar/.*$", "key": "secret1" },
+  { "route": "/foobar/.*$", "key": "secret1", "username": "demo", "password": "route-secret" },
   { "route": "/lorem/.*$",  "key": "ipsum-key" },
   { "route": "/.*$",       "key": "master-key" }
 ]
 ```
 
 When a backend registers, each route is checked against these rules. Only routes matching a rule regex with the correct key are accepted. Invalid regexes are caught at startup.
+Set `username` and `password` on a rule to require HTTP Basic Auth before client requests are forwarded to matching registered routes. The proxy strips the Basic Auth header after successful route authentication so route credentials are not sent to the backend.
 
 ---
 
@@ -412,14 +415,19 @@ Every proxied response includes an `X-Request-ID` header for end-to-end tracing.
 
 Set `enableAdminUI` to `true` to serve a lightweight dashboard at `adminPath`
 (default `/admin`). It shows current backend routes, request counters, cache
-state, and Go runtime scheduler metrics. Keep it disabled on public deployments
-unless the surrounding network or reverse proxy already restricts access.
+state, and Go runtime scheduler metrics. Set `adminPassword` to require Basic
+Auth for both the HTML dashboard and `/admin/api/status`. Keep the UI disabled
+on public deployments unless the surrounding network or reverse proxy also
+restricts access.
 
 Run the admin demo:
 
 ```bash
 make demo-admin
 ```
+
+The demo uses `admin/admin-demo` for the admin UI and `demo/route-demo` for
+the protected proxied route.
 
 ---
 
