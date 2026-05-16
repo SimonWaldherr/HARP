@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"expvar"
 	"flag"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	runtimemetrics "runtime/metrics"
 	"slices"
 	"strings"
 	"sync"
@@ -73,11 +75,18 @@ type Config struct {
 	EnableCORS            bool   `json:"enableCORS"`
 	CORSAllowedOrigins    string `json:"corsAllowedOrigins"`
 	GracefulShutdownDelay string `json:"gracefulShutdownDelay"`
+	EnableAdminUI         bool   `json:"enableAdminUI"`
+	AdminPath             string `json:"adminPath"`
 }
 
 type AllowedRegistrationRule struct {
 	Route string `json:"route"`
 	Key   string `json:"key"`
+}
+
+type compiledAllowedRegistrationRule struct {
+	pattern *regexp.Regexp
+	key     string
 }
 
 // Metrics structure for monitoring
@@ -94,9 +103,21 @@ type Metrics struct {
 }
 
 var (
-	config  Config
-	metrics *Metrics
+	config                   Config
+	metrics                  *Metrics
+	allowedRegistrationRules []compiledAllowedRegistrationRule
 )
+
+var schedulerMetricNames = []string{
+	"/sched/gomaxprocs:threads",
+	"/sched/goroutines:goroutines",
+	"/sched/goroutines/not-in-go:goroutines",
+	"/sched/goroutines/runnable:goroutines",
+	"/sched/goroutines/running:goroutines",
+	"/sched/goroutines/waiting:goroutines",
+	"/sched/goroutines-created:goroutines",
+	"/sched/threads/total:threads",
+}
 
 // Initialize metrics
 func initMetrics() {
@@ -156,9 +177,19 @@ func NewMemoryCache() *MemoryCache {
 
 func (mc *MemoryCache) Get(key string) (*pb.HTTPResponse, bool) {
 	mc.mu.RLock()
-	defer mc.mu.RUnlock()
 	item, ok := mc.items[key]
-	if !ok || time.Now().After(item.expiresAt) {
+	if !ok {
+		mc.mu.RUnlock()
+		return nil, false
+	}
+	expired := time.Now().After(item.expiresAt)
+	mc.mu.RUnlock()
+	if expired {
+		mc.mu.Lock()
+		if current, ok := mc.items[key]; ok && time.Now().After(current.expiresAt) {
+			delete(mc.items, key)
+		}
+		mc.mu.Unlock()
 		return nil, false
 	}
 	return item.resp, true
@@ -224,7 +255,9 @@ type DiskCache struct {
 }
 
 func NewDiskCache(dir string) *DiskCache {
-	os.MkdirAll(dir, 0755)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		logError("Error creating disk cache directory %s: %v", dir, err)
+	}
 	return &DiskCache{dir: dir}
 }
 
@@ -314,7 +347,7 @@ func NewRateLimiter(limit int) *RateLimiter {
 }
 
 func (rl *RateLimiter) Allow(clientIP string) bool {
-	if !config.EnableRateLimit {
+	if !config.EnableRateLimit || rl.limit <= 0 {
 		return true
 	}
 
@@ -325,7 +358,7 @@ func (rl *RateLimiter) Allow(clientIP string) bool {
 	requests := rl.requests[clientIP]
 
 	// Remove old requests (older than 1 second)
-	var validRequests []time.Time
+	validRequests := requests[:0]
 	for _, t := range requests {
 		if now.Sub(t) < time.Second {
 			validRequests = append(validRequests, t)
@@ -348,7 +381,7 @@ func (rl *RateLimiter) Cleanup() {
 	defer rl.mu.Unlock()
 	now := time.Now()
 	for ip, requests := range rl.requests {
-		var valid []time.Time
+		valid := requests[:0]
 		for _, t := range requests {
 			if now.Sub(t) < time.Second {
 				valid = append(valid, t)
@@ -393,6 +426,12 @@ type registeredRoute struct {
 	path    string
 }
 
+type routeSnapshot struct {
+	Name   string `json:"name"`
+	Domain string `json:"domain"`
+	Path   string `json:"path"`
+}
+
 var (
 	backendsMu sync.RWMutex
 	// Map route path to backend connection.
@@ -427,6 +466,35 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(health)
 }
 
+func registeredRoutesSnapshot() []routeSnapshot {
+	backendsMu.RLock()
+	defer backendsMu.RUnlock()
+
+	routes := make([]routeSnapshot, 0, len(backends))
+	seen := make(map[string]struct{}, len(backends))
+	for _, conn := range backends {
+		for _, route := range conn.routes {
+			key := backendKey(route.domain, route.path)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			routes = append(routes, routeSnapshot{
+				Name:   route.name,
+				Domain: route.domain,
+				Path:   route.path,
+			})
+		}
+	}
+	slices.SortFunc(routes, func(a, b routeSnapshot) int {
+		if cmp := strings.Compare(a.Domain, b.Domain); cmp != 0 {
+			return cmp
+		}
+		return strings.Compare(a.Path, b.Path)
+	})
+	return routes
+}
+
 // Metrics endpoint
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -448,6 +516,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 			"sys":         memStats.Sys,
 			"num_gc":      memStats.NumGC,
 		},
+		"runtime_scheduler": runtimeMetricSnapshot(schedulerMetricNames),
 	}
 
 	if cacheStore != nil {
@@ -457,6 +526,281 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(stats)
+}
+
+func adminStatusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var cacheSize int
+	if cacheStore != nil {
+		cacheSize = cacheStore.Size()
+	}
+
+	resp := map[string]interface{}{
+		"status": "healthy",
+		"uptime": time.Since(startTime).Seconds(),
+		"proxy": map[string]interface{}{
+			"grpcPort":      config.GRPCPort,
+			"httpPort":      config.HTTPPort,
+			"cacheEnabled":  config.EnableCache,
+			"cacheType":     config.CacheType,
+			"rateLimit":     config.EnableRateLimit,
+			"maxConcurrent": config.MaxConcurrentRequests,
+		},
+		"routes": registeredRoutesSnapshot(),
+		"counters": map[string]interface{}{
+			"requestsTotal":      metrics.RequestsTotal.Value(),
+			"cacheHits":          metrics.CacheHits.Value(),
+			"cacheMisses":        metrics.CacheMisses.Value(),
+			"backendErrors":      metrics.BackendErrors.Value(),
+			"activeConnections":  metrics.ActiveConnections.Value(),
+			"backendsRegistered": metrics.BackendsRegistered.Value(),
+			"rateLimited":        metrics.RateLimited.Value(),
+			"cacheSize":          cacheSize,
+		},
+		"runtimeScheduler": runtimeMetricSnapshot(schedulerMetricNames),
+	}
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		logError("Error writing admin status: %v", err)
+	}
+}
+
+func adminUIHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, adminHTML(adminPath()))
+}
+
+func adminHTML(path string) string {
+	return strings.ReplaceAll(adminHTMLTemplate, "__ADMIN_API__", path+"/api/status")
+}
+
+func adminPath() string {
+	path := config.AdminPath
+	if path == "" {
+		path = "/admin"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	path = strings.TrimRight(path, "/")
+	if path == "" {
+		return "/admin"
+	}
+	return path
+}
+
+func registerAdminHandlers(mux *http.ServeMux) {
+	if !config.EnableAdminUI {
+		return
+	}
+	path := adminPath()
+	mux.HandleFunc(path, adminUIHandler)
+	mux.HandleFunc(path+"/", adminUIHandler)
+	mux.HandleFunc(path+"/api/status", adminStatusHandler)
+}
+
+const adminHTMLTemplate = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HARP Admin</title>
+<style>
+:root {
+  --bg: #f4f1ea;
+  --ink: #18201c;
+  --muted: #69746e;
+  --line: #d9d3c6;
+  --panel: #fffdf8;
+  --accent: #0d7c66;
+  --accent-2: #c46f28;
+  --warn: #a8342f;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 20% 0%, rgba(13, 124, 102, .16), transparent 28rem),
+    linear-gradient(135deg, #f7f2e8 0%, #eef3ee 52%, #f6eee2 100%);
+  font: 15px/1.45 ui-sans-serif, "Avenir Next", "Segoe UI", sans-serif;
+}
+main { width: min(1180px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 42px; }
+header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 18px;
+  align-items: end;
+  padding: 22px 0 26px;
+}
+h1 { margin: 0; font-size: clamp(36px, 7vw, 76px); line-height: .9; letter-spacing: 0; }
+.subline { margin-top: 12px; color: var(--muted); max-width: 720px; }
+.status-pill {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  min-height: 34px;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255,255,255,.72);
+  font-weight: 700;
+}
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 5px rgba(13,124,102,.12); }
+.grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+.panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255,253,248,.86);
+  box-shadow: 0 18px 45px rgba(24,32,28,.08);
+  overflow: hidden;
+}
+.span-3 { grid-column: span 3; }
+.span-4 { grid-column: span 4; }
+.span-8 { grid-column: span 8; }
+.span-12 { grid-column: span 12; }
+.metric { padding: 18px; min-height: 124px; display: flex; flex-direction: column; justify-content: space-between; }
+.label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+.value { font-size: 34px; font-weight: 800; letter-spacing: 0; margin-top: 14px; }
+.panel h2 { margin: 0; padding: 16px 18px; border-bottom: 1px solid var(--line); font-size: 16px; letter-spacing: 0; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 12px 18px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+tr:last-child td { border-bottom: 0; }
+code { font-family: "SF Mono", Consolas, monospace; font-size: 13px; overflow-wrap: anywhere; }
+.runtime { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 18px; }
+.runtime div { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fffaf1; }
+.runtime strong { display: block; font-size: 22px; margin-bottom: 4px; }
+.toolbar { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-top: 1px solid var(--line); color: var(--muted); }
+button {
+  border: 1px solid #0b5f4f;
+  border-radius: 8px;
+  background: var(--accent);
+  color: white;
+  padding: 9px 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+.empty, .error { padding: 18px; color: var(--muted); }
+.error { color: var(--warn); }
+@media (max-width: 820px) {
+  header { grid-template-columns: 1fr; }
+  .span-3, .span-4, .span-8 { grid-column: span 12; }
+  .runtime { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>HARP Admin</h1>
+      <div class="subline">Live proxy state, backend routes, runtime pressure, and request counters.</div>
+    </div>
+    <div class="status-pill"><span class="dot"></span><span id="status">loading</span></div>
+  </header>
+
+  <section class="grid" aria-live="polite">
+    <article class="panel metric span-3"><div class="label">Backends</div><div class="value" id="backends">0</div></article>
+    <article class="panel metric span-3"><div class="label">Requests</div><div class="value" id="requests">0</div></article>
+    <article class="panel metric span-3"><div class="label">Cache hits</div><div class="value" id="hits">0</div></article>
+    <article class="panel metric span-3"><div class="label">Errors</div><div class="value" id="errors">0</div></article>
+
+    <article class="panel span-8">
+      <h2>Routes</h2>
+      <table>
+        <thead><tr><th>Name</th><th>Domain</th><th>Path</th></tr></thead>
+        <tbody id="routes"><tr><td colspan="3" class="empty">No routes registered</td></tr></tbody>
+      </table>
+    </article>
+
+    <article class="panel span-4">
+      <h2>Runtime</h2>
+      <div class="runtime" id="runtime"></div>
+      <div class="toolbar"><span id="updated">Waiting for data</span><button id="refresh">Refresh</button></div>
+    </article>
+  </section>
+</main>
+<script>
+const api = "__ADMIN_API__";
+const $ = (id) => document.getElementById(id);
+const fmt = (v) => Number(v || 0).toLocaleString();
+
+function metricKey(data, suffix) {
+  const metrics = data.runtimeScheduler || {};
+  return metrics[suffix] || 0;
+}
+
+function render(data) {
+  $("status").textContent = data.status || "unknown";
+  $("backends").textContent = fmt(data.counters && data.counters.activeConnections);
+  $("requests").textContent = fmt(data.counters && data.counters.requestsTotal);
+  $("hits").textContent = fmt(data.counters && data.counters.cacheHits);
+  $("errors").textContent = fmt(data.counters && data.counters.backendErrors);
+
+  const routes = data.routes || [];
+  $("routes").innerHTML = routes.length ? routes.map((route) =>
+    "<tr>" +
+    "<td>" + escapeHTML(route.name || "unnamed") + "</td>" +
+    "<td><code>" + escapeHTML(route.domain || "") + "</code></td>" +
+    "<td><code>" + escapeHTML(route.path || "") + "</code></td>" +
+    "</tr>"
+  ).join("") : "<tr><td colspan=\"3\" class=\"empty\">No routes registered</td></tr>";
+
+  const runtime = [
+    ["Goroutines", "/sched/goroutines:goroutines"],
+    ["Runnable", "/sched/goroutines/runnable:goroutines"],
+    ["Waiting", "/sched/goroutines/waiting:goroutines"],
+    ["Threads", "/sched/threads/total:threads"]
+  ];
+  $("runtime").innerHTML = runtime.map(([label, key]) =>
+    "<div><strong>" + fmt(metricKey(data, key)) + "</strong><span class=\"label\">" + label + "</span></div>"
+  ).join("");
+  $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
+}
+
+function escapeHTML(value) {
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[char]));
+}
+
+async function load() {
+  try {
+    const res = await fetch(api, { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    render(await res.json());
+  } catch (err) {
+    $("status").textContent = "error";
+    $("routes").innerHTML = "<tr><td colspan=\"3\" class=\"error\">" + escapeHTML(err.message) + "</td></tr>";
+  }
+}
+
+$("refresh").addEventListener("click", load);
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>`
+
+func runtimeMetricSnapshot(names []string) map[string]uint64 {
+	samples := make([]runtimemetrics.Sample, len(names))
+	for i, name := range names {
+		samples[i].Name = name
+	}
+	runtimemetrics.Read(samples)
+
+	out := make(map[string]uint64, len(samples))
+	for _, sample := range samples {
+		if sample.Value.Kind() == runtimemetrics.KindUint64 {
+			out[sample.Name] = sample.Value.Uint64()
+		}
+	}
+	return out
 }
 
 // --- gRPC Service Implementation ---
@@ -479,19 +823,7 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 	// Check each route against allowedRegistration rules.
 	allowedRoutes := []*pb.Route{}
 	for _, r := range reg.Routes {
-		allowed := false
-		for _, rule := range config.AllowedRegistration {
-			matched, err := regexp.MatchString(rule.Route, r.Path)
-			if err != nil {
-				logError("Error matching regex: %v", err)
-				continue
-			}
-			if matched && reg.Key == rule.Key {
-				allowed = true
-				break
-			}
-		}
-		if allowed {
+		if isRegistrationAllowed(r.Path, reg.Key) {
 			allowedRoutes = append(allowedRoutes, r)
 		}
 	}
@@ -554,7 +886,7 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 			ch, ok := pendingResponse[httpResp.RequestId]
 			pendingMu.RUnlock()
 			if ok {
-				ch <- httpResp
+				deliverPendingResponse(stream.Context(), httpResp, ch)
 			} else {
 				logDebug("No pending request for response ID %s", httpResp.RequestId)
 			}
@@ -568,6 +900,54 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 
 func backendKey(domain, path string) string {
 	return domain + "\x00" + path
+}
+
+func compileAllowedRegistrationRules(rules []AllowedRegistrationRule) ([]compiledAllowedRegistrationRule, error) {
+	compiled := make([]compiledAllowedRegistrationRule, 0, len(rules))
+	for _, rule := range rules {
+		pattern, err := regexp.Compile(rule.Route)
+		if err != nil {
+			return nil, fmt.Errorf("invalid regex in allowedRegistration route %q: %w", rule.Route, err)
+		}
+		compiled = append(compiled, compiledAllowedRegistrationRule{
+			pattern: pattern,
+			key:     rule.Key,
+		})
+	}
+	return compiled, nil
+}
+
+func isRegistrationAllowed(path, key string) bool {
+	rules := allowedRegistrationRules
+	if len(rules) == 0 && len(config.AllowedRegistration) > 0 {
+		var err error
+		rules, err = compileAllowedRegistrationRules(config.AllowedRegistration)
+		if err != nil {
+			logError("Error compiling allowed registration rules: %v", err)
+			return false
+		}
+	}
+	for _, rule := range rules {
+		if key == rule.key && rule.pattern.MatchString(path) {
+			return true
+		}
+	}
+	return false
+}
+
+func deliverPendingResponse(ctx context.Context, resp *pb.HTTPResponse, ch chan<- *pb.HTTPResponse) bool {
+	select {
+	case ch <- resp:
+		return true
+	case <-ctx.Done():
+		return false
+	default:
+		logWarn("Dropping response for request %s: response channel full", resp.RequestId)
+		if metrics != nil {
+			metrics.BackendErrors.Add(1)
+		}
+		return false
+	}
 }
 
 // --- HTTP Handler for Client Requests ---
@@ -852,6 +1232,7 @@ func startGRPCServer() {
 func startHTTPServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", httpHandler)
+	registerAdminHandlers(mux)
 
 	// Add health check endpoint
 	if config.EnableHealthCheck {
@@ -906,6 +1287,7 @@ func startHTTPSServer() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", httpHandler)
+	registerAdminHandlers(mux)
 
 	if config.EnableHealthCheck {
 		healthPath := config.HealthCheckPath
@@ -936,6 +1318,7 @@ func startHTTP3Server() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", httpHandler)
+	registerAdminHandlers(mux)
 
 	if config.EnableHealthCheck {
 		healthPath := config.HealthCheckPath
@@ -1020,31 +1403,50 @@ func loadConfig(path string) {
 		config.GracefulShutdownDelay = "10s"
 	}
 
-	// Validate config
+	if err := validateConfig(config); err != nil {
+		log.Fatalf("Config error: %v", err)
+	}
+	allowedRegistrationRules, err = compileAllowedRegistrationRules(config.AllowedRegistration)
+	if err != nil {
+		log.Fatalf("Config error: %v", err)
+	}
+}
+
+func validateConfig(config Config) error {
+	var errs []error
+
 	if config.EnableGRPCTLS && (config.GRPCTLSCert == "" || config.GRPCTLSKey == "") {
-		log.Fatal("Config error: enableGRPCTLS requires grpcTLSCert and grpcTLSKey")
+		errs = append(errs, errors.New("enableGRPCTLS requires grpcTLSCert and grpcTLSKey"))
 	}
 	if config.EnableHTTPS && (config.HTTPSCert == "" || config.HTTPSKey == "") {
-		log.Fatal("Config error: enableHTTPS requires httpsCert and httpsKey")
+		errs = append(errs, errors.New("enableHTTPS requires httpsCert and httpsKey"))
 	}
 	if config.EnableHTTP3 && !config.EnableHTTPS {
-		log.Fatal("Config error: enableHTTP3 requires enableHTTPS")
+		errs = append(errs, errors.New("enableHTTP3 requires enableHTTPS"))
 	}
-	if config.CacheTTL != "" {
-		if _, err := time.ParseDuration(config.CacheTTL); err != nil {
-			log.Fatalf("Config error: invalid cacheTTL %q: %v", config.CacheTTL, err)
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{"cacheTTL", config.CacheTTL},
+		{"requestTimeout", config.RequestTimeout},
+		{"readTimeout", config.ReadTimeout},
+		{"writeTimeout", config.WriteTimeout},
+		{"idleTimeout", config.IdleTimeout},
+		{"gracefulShutdownDelay", config.GracefulShutdownDelay},
+	} {
+		if field.value == "" {
+			continue
+		}
+		if _, err := time.ParseDuration(field.value); err != nil {
+			errs = append(errs, fmt.Errorf("invalid %s %q: %w", field.name, field.value, err))
 		}
 	}
-	if config.RequestTimeout != "" {
-		if _, err := time.ParseDuration(config.RequestTimeout); err != nil {
-			log.Fatalf("Config error: invalid requestTimeout %q: %v", config.RequestTimeout, err)
-		}
+	if _, err := compileAllowedRegistrationRules(config.AllowedRegistration); err != nil {
+		errs = append(errs, err)
 	}
-	for _, rule := range config.AllowedRegistration {
-		if _, err := regexp.Compile(rule.Route); err != nil {
-			log.Fatalf("Config error: invalid regex in allowedRegistration route %q: %v", rule.Route, err)
-		}
-	}
+
+	return errors.Join(errs...)
 }
 
 func main() {

@@ -1,0 +1,9 @@
+go 1.26.3
+
+use (
+	.
+	./demos/advanced-enterprise
+	./demos/remote-helper-go
+	./harp
+	./harpserver
+)

@@ -14,12 +14,9 @@
   "diskCacheDir": "./cache",
   "cacheTTL": "30m",
   "allowedRegistration": [
-    { "route": "/foobar/.*$", "key": "secret1" },
-    { "route": "/lorem/.*$",  "key": "ipsum-key" },
-    { "route": "/.*$",       "key": "master-key" }
+    { "route": "/.*$", "key": "master-key" }
   ],
-  "logLevel": "DEBUG",
-  
+  "logLevel": "INFO",
   "maxConcurrentRequests": 1000,
   "requestTimeout": "30s",
   "enableMetrics": true,
@@ -38,6 +35,6 @@
   "enableCORS": false,
   "corsAllowedOrigins": "*",
   "gracefulShutdownDelay": "10s",
-  "enableAdminUI": false,
+  "enableAdminUI": true,
   "adminPath": "/admin"
 }

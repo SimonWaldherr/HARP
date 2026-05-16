@@ -1,8 +1,14 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"expvar"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,6 +99,9 @@ func TestMemoryCacheExpiry(t *testing.T) {
 	if ok {
 		t.Error("expected cache miss after TTL expiry")
 	}
+	if mc.Size() != 0 {
+		t.Errorf("expected expired cache entry to be removed, got size %d", mc.Size())
+	}
 }
 
 func TestRateLimiter(t *testing.T) {
@@ -124,6 +133,17 @@ func TestRateLimiterDisabled(t *testing.T) {
 		if !rl.Allow(ip) {
 			t.Errorf("request %d should be allowed when rate limiting is disabled", i+1)
 		}
+	}
+}
+
+func TestRateLimiterZeroLimitAllowsRequests(t *testing.T) {
+	origEnabled := config.EnableRateLimit
+	config.EnableRateLimit = true
+	t.Cleanup(func() { config.EnableRateLimit = origEnabled })
+
+	rl := NewRateLimiter(0)
+	if !rl.Allow("127.0.0.1") {
+		t.Fatal("zero rate limit should disable limiting")
 	}
 }
 
@@ -304,6 +324,77 @@ func TestLoadConfigDefaults(t *testing.T) {
 	config = origConfig
 }
 
+func TestValidateConfigCollectsErrors(t *testing.T) {
+	err := validateConfig(Config{
+		EnableGRPCTLS: true,
+		EnableHTTPS:   true,
+		EnableHTTP3:   true,
+		CacheTTL:      "not-a-duration",
+		ReadTimeout:   "still-not-a-duration",
+		AllowedRegistration: []AllowedRegistrationRule{
+			{Route: "[", Key: "secret"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected validation errors")
+	}
+
+	msg := err.Error()
+	for _, want := range []string{
+		"enableGRPCTLS requires grpcTLSCert and grpcTLSKey",
+		"enableHTTPS requires httpsCert and httpsKey",
+		"invalid cacheTTL",
+		"invalid readTimeout",
+		"invalid regex in allowedRegistration route",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("expected validation error %q in %q", want, msg)
+		}
+	}
+}
+
+func TestCompiledAllowedRegistrationRules(t *testing.T) {
+	origConfig := config
+	origRules := allowedRegistrationRules
+	t.Cleanup(func() {
+		config = origConfig
+		allowedRegistrationRules = origRules
+	})
+
+	config.AllowedRegistration = []AllowedRegistrationRule{
+		{Route: "/api/.*$", Key: "secret"},
+	}
+	var err error
+	allowedRegistrationRules, err = compileAllowedRegistrationRules(config.AllowedRegistration)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+
+	if !isRegistrationAllowed("/api/users", "secret") {
+		t.Fatal("expected matching route/key to be allowed")
+	}
+	if isRegistrationAllowed("/api/users", "wrong-key") {
+		t.Fatal("expected wrong key to be rejected")
+	}
+	if isRegistrationAllowed("/other", "secret") {
+		t.Fatal("expected non-matching route to be rejected")
+	}
+}
+
+func TestDeliverPendingResponseDoesNotBlockWhenChannelFull(t *testing.T) {
+	ch := make(chan *pb.HTTPResponse, 1)
+	ch <- &pb.HTTPResponse{RequestId: "first"}
+
+	start := time.Now()
+	ok := deliverPendingResponse(context.Background(), &pb.HTTPResponse{RequestId: "second"}, ch)
+	if ok {
+		t.Fatal("expected full response channel delivery to fail")
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("delivery blocked too long: %s", elapsed)
+	}
+}
+
 func TestHeaderEnabled(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -346,6 +437,108 @@ func TestFilterInternalHeaders(t *testing.T) {
 	}
 	if _, ok := filtered["x-harp-stream-end"]; ok {
 		t.Fatalf("expected case-insensitive stream-end header to be removed")
+	}
+}
+
+func TestRuntimeMetricSnapshot(t *testing.T) {
+	snapshot := runtimeMetricSnapshot([]string{
+		"/sched/goroutines:goroutines",
+		"/does/not/exist:units",
+	})
+
+	if _, ok := snapshot["/sched/goroutines:goroutines"]; !ok {
+		t.Fatalf("expected scheduler goroutine metric to be present")
+	}
+	if _, ok := snapshot["/does/not/exist:units"]; ok {
+		t.Fatalf("unsupported runtime metrics should be omitted")
+	}
+}
+
+func TestAdminHandlersRespectConfig(t *testing.T) {
+	origConfig := config
+	t.Cleanup(func() { config = origConfig })
+
+	config.EnableAdminUI = false
+	mux := http.NewServeMux()
+	registerAdminHandlers(mux)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected disabled admin UI to return 404, got %d", rec.Code)
+	}
+
+	config.EnableAdminUI = true
+	config.AdminPath = "/admin"
+	mux = http.NewServeMux()
+	registerAdminHandlers(mux)
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected enabled admin UI to return 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "HARP Admin") {
+		t.Fatalf("expected admin HTML response, got %q", rec.Body.String())
+	}
+}
+
+func TestAdminStatusHandler(t *testing.T) {
+	origConfig := config
+	origMetrics := metrics
+	origCache := cacheStore
+	origStart := startTime
+	t.Cleanup(func() {
+		config = origConfig
+		metrics = origMetrics
+		cacheStore = origCache
+		startTime = origStart
+	})
+
+	config = Config{
+		GRPCPort:              ":50054",
+		HTTPPort:              ":8080",
+		EnableCache:           true,
+		CacheType:             "memory",
+		EnableRateLimit:       true,
+		MaxConcurrentRequests: 1000,
+	}
+	metrics = newTestMetrics()
+	metrics.RequestsTotal.Add(3)
+	cacheStore = NewMemoryCache()
+	startTime = time.Now().Add(-time.Second)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/status", nil)
+	adminStatusHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid json response: %v", err)
+	}
+	if body["status"] != "healthy" {
+		t.Fatalf("expected healthy status, got %#v", body["status"])
+	}
+	if _, ok := body["runtimeScheduler"].(map[string]interface{}); !ok {
+		t.Fatalf("expected runtimeScheduler object in response")
+	}
+}
+
+func newTestMetrics() *Metrics {
+	return &Metrics{
+		RequestsTotal:      new(expvar.Int),
+		RequestDuration:    new(expvar.Map).Init(),
+		CacheHits:          new(expvar.Int),
+		CacheMisses:        new(expvar.Int),
+		BackendErrors:      new(expvar.Int),
+		ActiveConnections:  new(expvar.Int),
+		BackendsRegistered: new(expvar.Int),
+		RouteRequests:      new(expvar.Map).Init(),
+		RateLimited:        new(expvar.Int),
 	}
 }
 

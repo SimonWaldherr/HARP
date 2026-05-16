@@ -179,6 +179,8 @@ The `config.json` file controls the proxy behavior:
 | `maxRequestBodySize` | int | `10485760` | Max request body in bytes (10 MB) |
 | `enableCORS` | bool | `false` | Enable CORS headers |
 | `corsAllowedOrigins` | string | `*` | Allowed CORS origins |
+| `enableAdminUI` | bool | `false` | Enable the built-in web admin dashboard |
+| `adminPath` | string | `/admin` | Admin dashboard path when enabled |
 | `enableHealthCheck` | bool | `true` | Enable `/health` endpoint |
 | `enableMetrics` | bool | `true` | Enable `/metrics` + pprof |
 | `metricsPort` | string | `:9091` | Metrics server listen address |
@@ -218,6 +220,7 @@ make test-race    # Tests with Go race detector
 make run          # Build and start the proxy
 make run-gateway  # Build and start the gateway agent
 make demo         # Full end-to-end demo (proxy + backend + curl)
+make demo-admin   # End-to-end demo with the web admin UI enabled
 make clean        # Remove build artifacts
 make help         # Show all available targets
 ```
@@ -404,6 +407,19 @@ When `enableMetrics` is `true`, a separate HTTP server starts on `metricsPort` e
 | `/debug/vars` | expvar variables |
 
 Every proxied response includes an `X-Request-ID` header for end-to-end tracing.
+
+## Web Admin UI
+
+Set `enableAdminUI` to `true` to serve a lightweight dashboard at `adminPath`
+(default `/admin`). It shows current backend routes, request counters, cache
+state, and Go runtime scheduler metrics. Keep it disabled on public deployments
+unless the surrounding network or reverse proxy already restricts access.
+
+Run the admin demo:
+
+```bash
+make demo-admin
+```
 
 ---
 
