@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -20,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -184,7 +186,7 @@ func (mc *MemoryCache) Set(key string, resp *pb.HTTPResponse) {
 				first = false
 			}
 		}
-		if first == false && oldestKey != "" && len(mc.items) >= mc.maxItems {
+		if !first && oldestKey != "" && len(mc.items) >= mc.maxItems {
 			delete(mc.items, oldestKey)
 		}
 	}
@@ -208,7 +210,7 @@ func (mc *MemoryCache) Delete(key string) {
 func (mc *MemoryCache) Clear() {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
-	mc.items = make(map[string]cacheItem)
+	clear(mc.items)
 }
 
 func (mc *MemoryCache) Size() int {
@@ -367,7 +369,10 @@ func getCacheKey(method, url string, headers map[string]string, body string) str
 	h := sha256.New()
 	h.Write([]byte(method))
 	h.Write([]byte(url))
-	for k, v := range headers {
+	keys := maps.Keys(headers)
+	slices.Sort(keys)
+	for _, k := range keys {
+		v := headers[k]
 		h.Write([]byte(k))
 		h.Write([]byte(v))
 	}

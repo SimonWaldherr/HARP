@@ -246,6 +246,20 @@ func TestGetCacheKeyDeterministic(t *testing.T) {
 	if key1 == key2 {
 		t.Error("different body should produce different cache keys")
 	}
+
+	headersA := map[string]string{
+		"Accept":       "text/html",
+		"Content-Type": "application/json",
+	}
+	headersB := map[string]string{
+		"Content-Type": "application/json",
+		"Accept":       "text/html",
+	}
+	cacheKeyA := getCacheKey("GET", "/page", headersA, "body")
+	cacheKeyB := getCacheKey("GET", "/page", headersB, "body")
+	if cacheKeyA != cacheKeyB {
+		t.Errorf("header map insertion order should not affect cache key: %s != %s", cacheKeyA, cacheKeyB)
+	}
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
