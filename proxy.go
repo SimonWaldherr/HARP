@@ -412,10 +412,14 @@ const (
 
 // Health check endpoint
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	backendsMu.RLock()
+	backendCount := len(backends)
+	backendsMu.RUnlock()
+
 	health := map[string]interface{}{
 		"status":    "healthy",
 		"timestamp": time.Now().Unix(),
-		"backends":  len(backends),
+		"backends":  backendCount,
 		"uptime":    time.Since(startTime).Seconds(),
 	}
 
@@ -501,7 +505,11 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 	// Create backend connection.
 	conn := &backendConn{stream: stream}
 	for _, r := range reg.Routes {
-		patternStr := reg.Domain + r.Path
+		routeDomain := r.Domain
+		if routeDomain == "" {
+			routeDomain = reg.Domain
+		}
+		patternStr := routeDomain + r.Path
 		pattern, err := regexp.Compile(patternStr)
 		if err != nil {
 			logError("Error compiling regexp for route %s: %v", r.Path, err)
@@ -510,13 +518,13 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 		conn.routes = append(conn.routes, registeredRoute{
 			name:    r.Name,
 			pattern: pattern,
-			domain:  reg.Domain,
+			domain:  routeDomain,
 			path:    r.Path,
 		})
 		backendsMu.Lock()
-		backends[r.Path] = conn
+		backends[backendKey(routeDomain, r.Path)] = conn
 		backendsMu.Unlock()
-		logDebug("Registered route: %s%s", reg.Domain, r.Path)
+		logDebug("Registered route: %s%s", routeDomain, r.Path)
 	}
 
 	metrics.BackendsRegistered.Add(1)
@@ -532,7 +540,7 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 				// Cleanup backend registration
 				backendsMu.Lock()
 				for _, route := range conn.routes {
-					delete(backends, route.path)
+					delete(backends, backendKey(route.domain, route.path))
 				}
 				backendsMu.Unlock()
 				metrics.BackendsRegistered.Add(-1)
@@ -556,6 +564,10 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 	<-stream.Context().Done()
 	logInfo("gRPC stream closed for backend: %s", reg.Name)
 	return nil
+}
+
+func backendKey(domain, path string) string {
+	return domain + "\x00" + path
 }
 
 // --- HTTP Handler for Client Requests ---
@@ -594,7 +606,7 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rate limiting
-	clientIP := r.RemoteAddr
+	clientIP := clientIPFromRemoteAddr(r.RemoteAddr)
 	if !rateLimiter.Allow(clientIP) {
 		metrics.RateLimited.Add(1)
 		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
@@ -653,20 +665,7 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Find the best matching backend (longest path wins).
-	var chosen *backendConn
-	var matchedRoute string
-	var bestLen int
-	backendsMu.RLock()
-	for _, conn := range backends {
-		for _, route := range conn.routes {
-			if route.pattern.MatchString(r.URL.Path) && len(route.path) > bestLen {
-				chosen = conn
-				matchedRoute = route.path
-				bestLen = len(route.path)
-			}
-		}
-	}
-	backendsMu.RUnlock()
+	chosen, matchedRoute := matchBackend(r.Host, r.URL.Path)
 
 	if matchedRoute != "" {
 		metrics.RouteRequests.Add(matchedRoute, 1)
@@ -762,6 +761,41 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Timeout waiting for backend", http.StatusGatewayTimeout)
 		metrics.BackendErrors.Add(1)
 	}
+}
+
+func matchBackend(host, path string) (*backendConn, string) {
+	var chosen *backendConn
+	var matchedRoute string
+	var bestLen int
+	requestRoute := routeTarget(host, path)
+
+	backendsMu.RLock()
+	defer backendsMu.RUnlock()
+	for _, conn := range backends {
+		for _, route := range conn.routes {
+			if route.pattern.MatchString(requestRoute) && len(route.path) > bestLen {
+				chosen = conn
+				matchedRoute = route.path
+				bestLen = len(route.path)
+			}
+		}
+	}
+	return chosen, matchedRoute
+}
+
+func routeTarget(host, path string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return host + path
+}
+
+func clientIPFromRemoteAddr(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
 }
 
 func headerEnabled(headers map[string]string, key string) bool {

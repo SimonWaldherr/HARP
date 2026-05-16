@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"regexp"
 	"testing"
 	"time"
 
@@ -345,5 +346,74 @@ func TestFilterInternalHeaders(t *testing.T) {
 	}
 	if _, ok := filtered["x-harp-stream-end"]; ok {
 		t.Fatalf("expected case-insensitive stream-end header to be removed")
+	}
+}
+
+func TestClientIPFromRemoteAddr(t *testing.T) {
+	tests := []struct {
+		remoteAddr string
+		want       string
+	}{
+		{"127.0.0.1:12345", "127.0.0.1"},
+		{"[::1]:12345", "::1"},
+		{"malformed-address", "malformed-address"},
+	}
+
+	for _, tc := range tests {
+		if got := clientIPFromRemoteAddr(tc.remoteAddr); got != tc.want {
+			t.Errorf("clientIPFromRemoteAddr(%q) = %q, want %q", tc.remoteAddr, got, tc.want)
+		}
+	}
+}
+
+func TestMatchBackendUsesHostAndPath(t *testing.T) {
+	origBackends := backends
+	backendsMu.Lock()
+	exampleBackend := &backendConn{
+		routes: []registeredRoute{{
+			name:    "example",
+			domain:  `example\.com`,
+			path:    "/api",
+			pattern: regexp.MustCompile(`example\.com/api`),
+		}},
+	}
+	otherBackend := &backendConn{
+		routes: []registeredRoute{{
+			name:    "other",
+			domain:  `other\.com`,
+			path:    "/api",
+			pattern: regexp.MustCompile(`other\.com/api`),
+		}},
+	}
+	backends = map[string]*backendConn{
+		backendKey(`example\.com`, "/api"): exampleBackend,
+		backendKey(`other\.com`, "/api"):   otherBackend,
+	}
+	backendsMu.Unlock()
+	t.Cleanup(func() {
+		backendsMu.Lock()
+		backends = origBackends
+		backendsMu.Unlock()
+	})
+
+	got, route := matchBackend("example.com", "/api/users")
+	if got != exampleBackend {
+		t.Fatalf("expected example.com backend, got %#v", got)
+	}
+	if route != "/api" {
+		t.Fatalf("expected matched route /api, got %q", route)
+	}
+
+	got, route = matchBackend("example.com:8080", "/api/users")
+	if got != exampleBackend {
+		t.Fatalf("expected example.com backend when Host includes a port, got %#v", got)
+	}
+	if route != "/api" {
+		t.Fatalf("expected matched route /api with Host port, got %q", route)
+	}
+
+	got, route = matchBackend("missing.example", "/api/users")
+	if got != nil || route != "" {
+		t.Fatalf("expected no backend for unmatched host, got %#v route %q", got, route)
 	}
 }
