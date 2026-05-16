@@ -1018,7 +1018,9 @@ func main() {
 	startTime = time.Now()
 	loadConfig(*configPath)
 	logInfo("Enhanced HARP proxy starting with configuration: %s", *configPath)
-	requestSem = make(chan struct{}, config.MaxConcurrentRequests)
+	if config.MaxConcurrentRequests > 0 {
+		requestSem = make(chan struct{}, config.MaxConcurrentRequests)
+	}
 
 	// Always initialize metrics (used in httpHandler unconditionally)
 	initMetrics()

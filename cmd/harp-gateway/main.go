@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
@@ -148,13 +149,12 @@ func main() {
 				if err != nil {
 					return err
 				}
-				client := *httpClient
+				cancel := func() {}
 				if svc.TimeoutSeconds > 0 {
-					client.Timeout = timeout
-				} else {
-					client.Timeout = 0
+					upReq, cancel = withRequestTimeout(upReq, timeout)
+					defer cancel()
 				}
-				resp, err := client.Do(upReq)
+				resp, err := httpClient.Do(upReq)
 				if err != nil {
 					return fmt.Errorf("upstream error: %w", err)
 				}
@@ -199,11 +199,9 @@ func main() {
 				log.Printf("[%s] Error building upstream request: %v", svc.Name, err)
 				return http.StatusBadGateway, nil, fmt.Sprintf("gateway error: %v", err)
 			}
-
-			client := *httpClient
-			client.Timeout = timeout
-
-			resp, err := client.Do(upReq)
+			upReq, cancel := withRequestTimeout(upReq, timeout)
+			defer cancel()
+			resp, err := httpClient.Do(upReq)
 			if err != nil {
 				log.Printf("[%s] Upstream error: %v", svc.Name, err)
 				return http.StatusBadGateway, nil, fmt.Sprintf("upstream error: %v", err)
@@ -264,4 +262,9 @@ func extractResponseHeaders(h http.Header) map[string]string {
 		}
 	}
 	return respHeaders
+}
+
+func withRequestTimeout(req *http.Request, timeout time.Duration) (*http.Request, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(req.Context(), timeout)
+	return req.WithContext(ctx), cancel
 }
