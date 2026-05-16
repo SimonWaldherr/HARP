@@ -20,6 +20,8 @@ import (
 	"github.com/SimonWaldherr/HARP/harpserver"
 )
 
+const streamChunkSize = 32 * 1024
+
 // GatewayConfig is the top-level configuration for the gateway agent.
 type GatewayConfig struct {
 	// Name identifies this gateway on the HARP proxy.
@@ -155,7 +157,7 @@ func main() {
 				respHeaders := extractResponseHeaders(resp.Header)
 				delete(respHeaders, "Content-Length")
 
-				buf := make([]byte, 32*1024)
+				buf := make([]byte, streamChunkSize)
 				firstChunkSent := false
 				for {
 					n, readErr := resp.Body.Read(buf)

@@ -405,8 +405,9 @@ var (
 )
 
 const (
-	streamHeader    = "X-Harp-Stream"
-	streamEndHeader = "X-Harp-Stream-End"
+	streamHeader              = "X-Harp-Stream"
+	streamEndHeader           = "X-Harp-Stream-End"
+	responseChannelBufferSize = 64
 )
 
 // Health check endpoint
@@ -678,7 +679,7 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Prepare channel for response.
-	respCh := make(chan *pb.HTTPResponse, 64)
+	respCh := make(chan *pb.HTTPResponse, responseChannelBufferSize)
 	pendingMu.Lock()
 	pendingResponse[reqID] = respCh
 	pendingMu.Unlock()
