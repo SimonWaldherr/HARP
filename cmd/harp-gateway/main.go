@@ -15,12 +15,19 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/SimonWaldherr/HARP/harpserver"
 )
 
 const streamChunkSize = 32 * 1024
+
+var streamBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, streamChunkSize)
+	},
+}
 
 // GatewayConfig is the top-level configuration for the gateway agent.
 type GatewayConfig struct {
@@ -120,7 +127,6 @@ func main() {
 			MaxIdleConnsPerHost: maxIdleConnsPerHost,
 			MaxConnsPerHost:     cfg.UpstreamMaxConnsPerHost,
 			IdleConnTimeout:     90 * time.Second,
-			ForceAttemptHTTP2:   true,
 		},
 	}
 
@@ -157,7 +163,8 @@ func main() {
 				respHeaders := extractResponseHeaders(resp.Header)
 				delete(respHeaders, "Content-Length")
 
-				buf := make([]byte, streamChunkSize)
+				buf := streamBufferPool.Get().([]byte)
+				defer streamBufferPool.Put(buf)
 				firstChunkSent := false
 				for {
 					n, readErr := resp.Body.Read(buf)

@@ -325,8 +325,8 @@ func TestHeaderEnabled(t *testing.T) {
 func TestFilterInternalHeaders(t *testing.T) {
 	headers := map[string]string{
 		"Content-Type":      "text/event-stream",
-		streamHeader:        "1",
-		streamEndHeader:     "1",
+		pb.StreamHeader:     "1",
+		pb.StreamEndHeader:  "1",
 		"X-Another-Header":  "ok",
 		"x-harp-stream-end": "1",
 	}
@@ -337,11 +337,11 @@ func TestFilterInternalHeaders(t *testing.T) {
 	if filtered["X-Another-Header"] != "ok" {
 		t.Fatalf("expected custom header to be preserved")
 	}
-	if _, ok := filtered[streamHeader]; ok {
-		t.Fatalf("expected %s to be removed", streamHeader)
+	if _, ok := filtered[pb.StreamHeader]; ok {
+		t.Fatalf("expected %s to be removed", pb.StreamHeader)
 	}
-	if _, ok := filtered[streamEndHeader]; ok {
-		t.Fatalf("expected %s to be removed", streamEndHeader)
+	if _, ok := filtered[pb.StreamEndHeader]; ok {
+		t.Fatalf("expected %s to be removed", pb.StreamEndHeader)
 	}
 	if _, ok := filtered["x-harp-stream-end"]; ok {
 		t.Fatalf("expected case-insensitive stream-end header to be removed")

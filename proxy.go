@@ -210,7 +210,7 @@ func (mc *MemoryCache) Delete(key string) {
 func (mc *MemoryCache) Clear() {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
-	clear(mc.items)
+	mc.items = make(map[string]cacheItem)
 }
 
 func (mc *MemoryCache) Size() int {
@@ -405,8 +405,6 @@ var (
 )
 
 const (
-	streamHeader              = "X-Harp-Stream"
-	streamEndHeader           = "X-Harp-Stream-End"
 	responseChannelBufferSize = 64
 )
 
@@ -715,7 +713,7 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case resp := <-respCh:
-		isStream := headerEnabled(resp.Headers, streamHeader)
+		isStream := headerEnabled(resp.Headers, pb.StreamHeader)
 		firstStatus := int(resp.Status)
 		firstHeaders := filterInternalHeaders(resp.Headers)
 		var bodyBuilder strings.Builder
@@ -739,7 +737,7 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			if !isStream || headerEnabled(resp.Headers, streamEndHeader) {
+			if !isStream || headerEnabled(resp.Headers, pb.StreamEndHeader) {
 				if config.EnableCache && strings.ToUpper(r.Method) == "GET" && config.CacheType != "none" && !isStream {
 					cacheStore.Set(cacheKey, &pb.HTTPResponse{
 						Status:  int32(firstStatus),
@@ -772,7 +770,7 @@ func headerEnabled(headers map[string]string, key string) bool {
 func filterInternalHeaders(headers map[string]string) map[string]string {
 	out := make(map[string]string, len(headers))
 	for k, v := range headers {
-		if strings.EqualFold(k, streamHeader) || strings.EqualFold(k, streamEndHeader) {
+		if strings.EqualFold(k, pb.StreamHeader) || strings.EqualFold(k, pb.StreamEndHeader) {
 			continue
 		}
 		out[k] = v

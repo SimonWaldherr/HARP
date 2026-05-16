@@ -193,18 +193,18 @@ func (h *RemoteHelper) handleRequest(
 			if headers == nil {
 				headers = make(map[string]string)
 			}
-			headers["X-Harp-Stream"] = "1"
+			headers[pb.StreamHeader] = "1"
 			if end {
-				headers["X-Harp-Stream-End"] = "1"
+				headers[pb.StreamEndHeader] = "1"
 			}
 			return h.sendResponse(stream, reqProto, statusCode, headers, body, sendMu)
 		})
 		if err != nil {
 			log.Printf("RemoteHelper %s: stream handler error: %v", h.Name, err)
 			_ = h.sendResponse(stream, reqProto, http.StatusBadGateway, map[string]string{
-				"Content-Type":      "text/plain",
-				"X-Harp-Stream":     "1",
-				"X-Harp-Stream-End": "1",
+				"Content-Type":     "text/plain",
+				pb.StreamHeader:    "1",
+				pb.StreamEndHeader: "1",
 			}, "stream handler error: "+err.Error(), sendMu)
 		}
 		return
