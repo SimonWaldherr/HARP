@@ -1,17 +1,17 @@
-# LLM Gateway Demo (Hetzner + Home Network)
+# LLM Gateway Demo (Public HARP Proxy + Home Network)
 
 This demo shows how to expose local LLM endpoints (Ollama, LM Studio, llmster)
-running on your home network through a public HARP proxy on your Hetzner server.
+running on your home network through a public HARP proxy.
 
 The flow is:
 
-1. **Hetzner server:** run HARP proxy (public HTTP + gRPC).
+1. **Public server/VPS:** run HARP proxy (public HTTP + gRPC).
 2. **Home network machine:** run `harp-gateway` with the config from this demo.
-3. Clients call your Hetzner URL; HARP forwards requests over gRPC to your home gateway.
+3. Clients call your public URL; HARP forwards requests over gRPC to your home gateway.
 
 No inbound ports are required on your home router.
 
-## 1) Prepare proxy config on Hetzner
+## 1) Prepare proxy config on your public host
 
 In your proxy `config.json`, allow the LLM routes and key used by the gateway:
 
@@ -31,11 +31,11 @@ make build-gateway
 ```
 
 Edit `gateway-llm-example.json` first:
-- set `proxyURL` to your Hetzner HARP gRPC address
+- set `proxyURL` to your public HARP gRPC address
 - set `key` to the registration key configured on the proxy
 - adjust upstream ports/hosts if your local services differ
 
-## 3) Test through your Hetzner proxy
+## 3) Test through your public proxy
 
 Assuming your public proxy HTTP URL is `https://proxy.example.com`:
 
@@ -60,5 +60,10 @@ curl https://proxy.example.com/llm/llmster/v1/models
   - `/llm/ollama/...`   -> `http://127.0.0.1:11434/...`
   - `/llm/lmstudio/...` -> `http://127.0.0.1:1234/...`
   - `/llm/llmster/...`  -> `http://127.0.0.1:8000/...` (change as needed)
+- For token/SSE style streaming, set `"streaming": true` on a service route.
+- For higher throughput, tune:
+  - `upstreamMaxIdleConns`
+  - `upstreamMaxIdleConnsPerHost`
+  - `upstreamMaxConnsPerHost`
 - If your local endpoint requires auth, add headers in the service `addHeaders` map.
-- Prefer HTTPS on Hetzner and strong registration keys.
+- Prefer HTTPS on your public host and strong registration keys.

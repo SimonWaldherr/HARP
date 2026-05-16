@@ -34,6 +34,12 @@ type GatewayConfig struct {
 	ReconnectInterval string `json:"reconnectInterval"`
 	// Services lists the local services to expose.
 	Services []ServiceConfig `json:"services"`
+	// UpstreamMaxIdleConns sets Transport.MaxIdleConns (default 200).
+	UpstreamMaxIdleConns int `json:"upstreamMaxIdleConns"`
+	// UpstreamMaxIdleConnsPerHost sets Transport.MaxIdleConnsPerHost (default 100).
+	UpstreamMaxIdleConnsPerHost int `json:"upstreamMaxIdleConnsPerHost"`
+	// UpstreamMaxConnsPerHost sets Transport.MaxConnsPerHost (default 0 = unlimited).
+	UpstreamMaxConnsPerHost int `json:"upstreamMaxConnsPerHost"`
 }
 
 // ServiceConfig describes a single local service to expose via HARP.
@@ -52,6 +58,8 @@ type ServiceConfig struct {
 	AddHeaders map[string]string `json:"addHeaders"`
 	// TimeoutSeconds is the per-request timeout for the upstream call (default 30).
 	TimeoutSeconds int `json:"timeoutSeconds"`
+	// Streaming enables chunked forwarding for long-lived responses (SSE/token streams).
+	Streaming bool `json:"streaming"`
 }
 
 func main() {
@@ -93,11 +101,24 @@ func main() {
 		ReconnectInterval: reconnect,
 	}
 
-	// Create an HTTP client with sensible defaults for local-network calls.
+	maxIdleConns := cfg.UpstreamMaxIdleConns
+	if maxIdleConns <= 0 {
+		maxIdleConns = 200
+	}
+	maxIdleConnsPerHost := cfg.UpstreamMaxIdleConnsPerHost
+	if maxIdleConnsPerHost <= 0 {
+		maxIdleConnsPerHost = 100
+	}
+
+	// Create an HTTP client with concurrency-friendly defaults for local upstreams.
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
-			MaxIdleConnsPerHost: 10,
+			MaxIdleConns:        maxIdleConns,
+			MaxIdleConnsPerHost: maxIdleConnsPerHost,
+			MaxConnsPerHost:     cfg.UpstreamMaxConnsPerHost,
+			IdleConnTimeout:     90 * time.Second,
+			ForceAttemptHTTP2:   true,
 		},
 	}
 
@@ -110,40 +131,64 @@ func main() {
 
 		log.Printf("Registering service %q: %s -> %s (stripPrefix=%v)", svc.Name, svc.Route, svc.Upstream, svc.StripPrefix)
 
-		helper.Register(svc.Route, svc.Name, func(r *http.Request) (int, map[string]string, string) {
-			// Build the upstream URL.
-			path := r.URL.Path
-			if svc.StripPrefix {
-				path = strings.TrimPrefix(path, strings.TrimSuffix(svc.Route, "/"))
-				if path == "" {
-					path = "/"
+		if svc.Streaming {
+			helper.RegisterStream(svc.Route, svc.Name, func(
+				r *http.Request,
+				send func(statusCode int, headers map[string]string, body string, end bool) error,
+			) error {
+				upReq, err := buildUpstreamRequest(r, svc)
+				if err != nil {
+					return err
 				}
-			}
-			upstreamURL := strings.TrimSuffix(svc.Upstream, "/") + path
-			if r.URL.RawQuery != "" {
-				upstreamURL += "?" + r.URL.RawQuery
-			}
+				client := *httpClient
+				if svc.TimeoutSeconds > 0 {
+					client.Timeout = timeout
+				} else {
+					client.Timeout = 0
+				}
+				resp, err := client.Do(upReq)
+				if err != nil {
+					return fmt.Errorf("upstream error: %w", err)
+				}
+				defer resp.Body.Close()
 
-			// Build upstream request.
-			var body io.Reader
-			if r.Body != nil {
-				body = r.Body
-			}
-			upReq, err := http.NewRequest(r.Method, upstreamURL, body)
+				respHeaders := extractResponseHeaders(resp.Header)
+				delete(respHeaders, "Content-Length")
+
+				buf := make([]byte, 32*1024)
+				firstChunkSent := false
+				for {
+					n, readErr := resp.Body.Read(buf)
+					if n > 0 {
+						chunkHeaders := map[string]string(nil)
+						if !firstChunkSent {
+							chunkHeaders = respHeaders
+						}
+						if err := send(resp.StatusCode, chunkHeaders, string(buf[:n]), false); err != nil {
+							return err
+						}
+						firstChunkSent = true
+					}
+					if readErr == io.EOF {
+						endHeaders := map[string]string(nil)
+						if !firstChunkSent {
+							endHeaders = respHeaders
+						}
+						return send(resp.StatusCode, endHeaders, "", true)
+					}
+					if readErr != nil {
+						return fmt.Errorf("stream read error: %w", readErr)
+					}
+				}
+			})
+			continue
+		}
+
+		helper.Register(svc.Route, svc.Name, func(r *http.Request) (int, map[string]string, string) {
+			upReq, err := buildUpstreamRequest(r, svc)
 			if err != nil {
 				log.Printf("[%s] Error building upstream request: %v", svc.Name, err)
 				return http.StatusBadGateway, nil, fmt.Sprintf("gateway error: %v", err)
-			}
-
-			// Copy original headers.
-			for k, vals := range r.Header {
-				for _, v := range vals {
-					upReq.Header.Add(k, v)
-				}
-			}
-			// Add configured extra headers.
-			for k, v := range svc.AddHeaders {
-				upReq.Header.Set(k, v)
 			}
 
 			client := *httpClient
@@ -162,18 +207,52 @@ func main() {
 				return http.StatusBadGateway, nil, "error reading upstream response"
 			}
 
-			// Collect response headers.
-			respHeaders := make(map[string]string)
-			for k, v := range resp.Header {
-				if len(v) > 0 {
-					respHeaders[k] = v[0]
-				}
-			}
-
-			return resp.StatusCode, respHeaders, string(respBody)
+			return resp.StatusCode, extractResponseHeaders(resp.Header), string(respBody)
 		})
 	}
 
 	log.Printf("harp-gateway %q connecting to %s with %d service(s)...", cfg.Name, cfg.ProxyURL, len(cfg.Services))
 	log.Fatal(helper.ListenAndServe())
+}
+
+func buildUpstreamRequest(r *http.Request, svc ServiceConfig) (*http.Request, error) {
+	path := r.URL.Path
+	if svc.StripPrefix {
+		path = strings.TrimPrefix(path, strings.TrimSuffix(svc.Route, "/"))
+		if path == "" {
+			path = "/"
+		}
+	}
+	upstreamURL := strings.TrimSuffix(svc.Upstream, "/") + path
+	if r.URL.RawQuery != "" {
+		upstreamURL += "?" + r.URL.RawQuery
+	}
+
+	var body io.Reader
+	if r.Body != nil {
+		body = r.Body
+	}
+	upReq, err := http.NewRequest(r.Method, upstreamURL, body)
+	if err != nil {
+		return nil, err
+	}
+	for k, vals := range r.Header {
+		for _, v := range vals {
+			upReq.Header.Add(k, v)
+		}
+	}
+	for k, v := range svc.AddHeaders {
+		upReq.Header.Set(k, v)
+	}
+	return upReq, nil
+}
+
+func extractResponseHeaders(h http.Header) map[string]string {
+	respHeaders := make(map[string]string)
+	for k, v := range h {
+		if len(v) > 0 {
+			respHeaders[k] = v[0]
+		}
+	}
+	return respHeaders
 }

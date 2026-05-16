@@ -302,3 +302,48 @@ func TestLoadConfigDefaults(t *testing.T) {
 	// Restore config
 	config = origConfig
 }
+
+func TestHeaderEnabled(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+		want    bool
+	}{
+		{"one", map[string]string{"X-Test": "1"}, true},
+		{"true", map[string]string{"X-Test": "true"}, true},
+		{"yes", map[string]string{"X-Test": "yes"}, true},
+		{"false", map[string]string{"X-Test": "false"}, false},
+		{"missing", map[string]string{}, false},
+	}
+	for _, tc := range tests {
+		if got := headerEnabled(tc.headers, "X-Test"); got != tc.want {
+			t.Errorf("%s: expected %v, got %v", tc.name, tc.want, got)
+		}
+	}
+}
+
+func TestFilterInternalHeaders(t *testing.T) {
+	headers := map[string]string{
+		"Content-Type":      "text/event-stream",
+		streamHeader:        "1",
+		streamEndHeader:     "1",
+		"X-Another-Header":  "ok",
+		"x-harp-stream-end": "1",
+	}
+	filtered := filterInternalHeaders(headers)
+	if filtered["Content-Type"] != "text/event-stream" {
+		t.Fatalf("expected Content-Type to be preserved")
+	}
+	if filtered["X-Another-Header"] != "ok" {
+		t.Fatalf("expected custom header to be preserved")
+	}
+	if _, ok := filtered[streamHeader]; ok {
+		t.Fatalf("expected %s to be removed", streamHeader)
+	}
+	if _, ok := filtered[streamEndHeader]; ok {
+		t.Fatalf("expected %s to be removed", streamEndHeader)
+	}
+	if _, ok := filtered["x-harp-stream-end"]; ok {
+		t.Fatalf("expected case-insensitive stream-end header to be removed")
+	}
+}

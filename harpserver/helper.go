@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	pb "github.com/SimonWaldherr/HARP/harp"
@@ -23,6 +24,13 @@ import (
 // lightweight route handlers without standing up a full HTTP server.
 type HelperHandlerFunc func(r *http.Request) (statusCode int, headers map[string]string, body string)
 
+// HelperStreamHandlerFunc processes an incoming request and can send multiple
+// response chunks for long-lived/streaming upstreams (e.g. SSE or token streams).
+type HelperStreamHandlerFunc func(
+	r *http.Request,
+	send func(statusCode int, headers map[string]string, body string, end bool) error,
+) error
+
 // HelperRoute binds a URL path prefix to a HelperHandlerFunc.
 type HelperRoute struct {
 	// Name is a human-readable identifier for this route.
@@ -31,6 +39,8 @@ type HelperRoute struct {
 	Path string
 	// Handler is called for every request whose URL path matches this route.
 	Handler HelperHandlerFunc
+	// StreamHandler is called for streaming routes and may emit multiple chunks.
+	StreamHandler HelperStreamHandlerFunc
 }
 
 // RemoteHelper connects to a HARP proxy and dispatches incoming HTTP requests
@@ -61,6 +71,12 @@ type RemoteHelper struct {
 // each incoming request.
 func (h *RemoteHelper) Register(path, name string, fn HelperHandlerFunc) {
 	h.Routes = append(h.Routes, HelperRoute{Name: name, Path: path, Handler: fn})
+}
+
+// RegisterStream adds a streaming route handler that can emit multiple response
+// chunks for a single request.
+func (h *RemoteHelper) RegisterStream(path, name string, fn HelperStreamHandlerFunc) {
+	h.Routes = append(h.Routes, HelperRoute{Name: name, Path: path, StreamHandler: fn})
 }
 
 // ListenAndServe connects to the HARP proxy, registers all routes, and
@@ -126,10 +142,11 @@ func (h *RemoteHelper) connectOnce() error {
 	log.Printf("RemoteHelper %s registered with %d route(s)", h.Name, len(protoRoutes))
 
 	// Build a fast path→handler lookup map.
-	routeMap := make(map[string]HelperHandlerFunc, len(h.Routes))
+	routeMap := make(map[string]HelperRoute, len(h.Routes))
 	for _, r := range h.Routes {
-		routeMap[r.Path] = r.Handler
+		routeMap[r.Path] = r
 	}
+	var sendMu sync.Mutex
 
 	for {
 		msg, err := stream.Recv()
@@ -141,7 +158,7 @@ func (h *RemoteHelper) connectOnce() error {
 			continue
 		}
 		// Handle each request in its own goroutine to avoid head-of-line blocking.
-		go h.handleRequest(stream, reqProto, routeMap)
+		go h.handleRequest(stream, reqProto, routeMap, &sendMu)
 	}
 }
 
@@ -150,7 +167,8 @@ func (h *RemoteHelper) connectOnce() error {
 func (h *RemoteHelper) handleRequest(
 	stream pb.HarpService_ProxyClient,
 	reqProto *pb.HTTPRequest,
-	routeMap map[string]HelperHandlerFunc,
+	routeMap map[string]HelperRoute,
+	sendMu *sync.Mutex,
 ) {
 	req, err := convertProtoToHTTPRequest(reqProto)
 	if err != nil {
@@ -159,30 +177,64 @@ func (h *RemoteHelper) handleRequest(
 	}
 
 	// Find the longest matching path prefix.
-	var fn HelperHandlerFunc
+	var matched HelperRoute
+	var hasRoute bool
 	var bestLen int
-	for path, handler := range routeMap {
+	for path, route := range routeMap {
 		if strings.HasPrefix(req.URL.Path, path) && len(path) > bestLen {
-			fn = handler
+			matched = route
+			hasRoute = true
 			bestLen = len(path)
 		}
+	}
+
+	if hasRoute && matched.StreamHandler != nil {
+		err := matched.StreamHandler(req, func(statusCode int, headers map[string]string, body string, end bool) error {
+			if headers == nil {
+				headers = make(map[string]string)
+			}
+			headers["X-Harp-Stream"] = "1"
+			if end {
+				headers["X-Harp-Stream-End"] = "1"
+			}
+			return h.sendResponse(stream, reqProto, statusCode, headers, body, sendMu)
+		})
+		if err != nil {
+			log.Printf("RemoteHelper %s: stream handler error: %v", h.Name, err)
+			_ = h.sendResponse(stream, reqProto, http.StatusBadGateway, map[string]string{
+				"Content-Type":      "text/plain",
+				"X-Harp-Stream":     "1",
+				"X-Harp-Stream-End": "1",
+			}, "stream handler error: "+err.Error(), sendMu)
+		}
+		return
 	}
 
 	var statusCode int
 	var headers map[string]string
 	var body string
-
-	if fn != nil {
-		statusCode, headers, body = fn(req)
+	if hasRoute && matched.Handler != nil {
+		statusCode, headers, body = matched.Handler(req)
 	} else {
 		statusCode = http.StatusNotFound
 		headers = map[string]string{"Content-Type": "text/plain"}
 		body = "no handler registered for " + req.URL.Path
 	}
-	if headers == nil {
-		headers = make(map[string]string)
+	returnHeaders := headers
+	if returnHeaders == nil {
+		returnHeaders = make(map[string]string)
 	}
+	_ = h.sendResponse(stream, reqProto, statusCode, returnHeaders, body, sendMu)
+}
 
+func (h *RemoteHelper) sendResponse(
+	stream pb.HarpService_ProxyClient,
+	reqProto *pb.HTTPRequest,
+	statusCode int,
+	headers map[string]string,
+	body string,
+	sendMu *sync.Mutex,
+) error {
 	respProto := &pb.HTTPResponse{
 		Status:    int32(statusCode),
 		Headers:   headers,
@@ -192,9 +244,15 @@ func (h *RemoteHelper) handleRequest(
 		Latency:   time.Since(time.Unix(0, reqProto.Timestamp)).Nanoseconds(),
 	}
 
+	if sendMu != nil {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+	}
 	if err := stream.Send(&pb.ClientMessage{
 		Payload: &pb.ClientMessage_HttpResponse{HttpResponse: respProto},
 	}); err != nil {
 		log.Printf("RemoteHelper %s: error sending response: %v", h.Name, err)
+		return err
 	}
+	return nil
 }

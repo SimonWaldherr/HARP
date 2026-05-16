@@ -4,6 +4,9 @@
   "key": "master-key",
   "domain": ".*",
   "reconnectInterval": "5s",
+  "upstreamMaxIdleConns": 200,
+  "upstreamMaxIdleConnsPerHost": 100,
+  "upstreamMaxConnsPerHost": 0,
   "services": [
     {
       "name": "Home Assistant",

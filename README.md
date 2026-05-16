@@ -254,7 +254,7 @@ The **demos/** folder includes several backend examples:
 
 6. **LLM Gateway Demo (demos/llm-gateway):**  
    Exposes local Ollama / LM Studio / llmster endpoints through your public
-   HARP proxy (e.g. on a Hetzner server) using `harp-gateway` JSON config only.
+   HARP proxy (on any public host) using `harp-gateway` JSON config only.
 
 ---
 
@@ -335,12 +335,16 @@ make build-gateway
   "key": "master-key",
   "domain": ".*",
   "reconnectInterval": "5s",
+  "upstreamMaxIdleConns": 200,
+  "upstreamMaxIdleConnsPerHost": 100,
+  "upstreamMaxConnsPerHost": 0,
   "services": [
     {
       "name": "Home Assistant",
       "route": "/homeassistant/",
       "upstream": "http://localhost:8123",
       "stripPrefix": true,
+      "streaming": true,
       "addHeaders": {
         "Authorization": "Bearer YOUR_HA_TOKEN"
       },
@@ -370,6 +374,7 @@ make build-gateway
 | `route` | string | *required* | Public path prefix registered with the proxy |
 | `upstream` | string | *required* | Local HTTP base URL to forward requests to |
 | `stripPrefix` | bool | `false` | Remove the route prefix before forwarding (e.g. `/pihole/admin/index` → `/admin/index`) |
+| `streaming` | bool | `false` | Enable chunked streaming relay for long-lived responses (SSE/token streams) |
 | `addHeaders` | object | `{}` | Extra headers injected into every upstream request (auth tokens, API keys, …) |
 | `timeoutSeconds` | int | `30` | Per-request timeout for the upstream call |
 
