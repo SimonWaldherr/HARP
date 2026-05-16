@@ -1,0 +1,30 @@
+{
+  "name": "home-llm-gateway",
+  "proxyURL": "YOUR_HETZNER_HOST:50054",
+  "key": "master-key",
+  "domain": ".*",
+  "reconnectInterval": "5s",
+  "services": [
+    {
+      "name": "Ollama",
+      "route": "/llm/ollama/",
+      "upstream": "http://127.0.0.1:11434",
+      "stripPrefix": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "name": "LM Studio",
+      "route": "/llm/lmstudio/",
+      "upstream": "http://127.0.0.1:1234",
+      "stripPrefix": true,
+      "timeoutSeconds": 120
+    },
+    {
+      "name": "llmster",
+      "route": "/llm/llmster/",
+      "upstream": "http://127.0.0.1:8000",
+      "stripPrefix": true,
+      "timeoutSeconds": 120
+    }
+  ]
+}

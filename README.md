@@ -252,6 +252,10 @@ The **demos/** folder includes several backend examples:
    (Home Assistant state, local commands) to a public HARP proxy without
    requiring any inbound firewall rules.
 
+6. **LLM Gateway Demo (demos/llm-gateway):**  
+   Exposes local Ollama / LM Studio / llmster endpoints through your public
+   HARP proxy (e.g. on a Hetzner server) using `harp-gateway` JSON config only.
+
 ---
 
 ## Using the Web Handler Wrapper
@@ -379,6 +383,7 @@ make build-gateway
 Auto-reconnect is built in — if the connection to the proxy drops, the gateway retries every `reconnectInterval`.
 
 See [cmd/harp-gateway/gateway-example.json](cmd/harp-gateway/gateway-example.json) for the full example config.
+For a ready-to-use home-LLM setup, see [demos/llm-gateway](demos/llm-gateway/).
 
 ---
 
