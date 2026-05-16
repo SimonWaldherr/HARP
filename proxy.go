@@ -405,7 +405,9 @@ var (
 )
 
 const (
-	responseChannelBufferSize = 64
+	// Small burst buffer for streamed chunks to reduce head-of-line blocking
+	// on backend receive loops while keeping per-request memory bounded.
+	responseChannelBufferSize = 8
 )
 
 // Health check endpoint

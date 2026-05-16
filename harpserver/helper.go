@@ -175,6 +175,7 @@ func (h *RemoteHelper) handleRequest(
 		log.Printf("RemoteHelper %s: error converting request: %v", h.Name, err)
 		return
 	}
+	requestStart := time.Unix(0, reqProto.Timestamp)
 
 	// Find the longest matching path prefix.
 	var matched HelperRoute
@@ -197,11 +198,11 @@ func (h *RemoteHelper) handleRequest(
 			if end {
 				headers[pb.StreamEndHeader] = "1"
 			}
-			return h.sendResponse(stream, reqProto, statusCode, headers, body, sendMu)
+			return h.sendResponse(stream, reqProto, requestStart, statusCode, headers, body, sendMu)
 		})
 		if err != nil {
 			log.Printf("RemoteHelper %s: stream handler error: %v", h.Name, err)
-			_ = h.sendResponse(stream, reqProto, http.StatusBadGateway, map[string]string{
+			_ = h.sendResponse(stream, reqProto, requestStart, http.StatusBadGateway, map[string]string{
 				"Content-Type":     "text/plain",
 				pb.StreamHeader:    "1",
 				pb.StreamEndHeader: "1",
@@ -224,12 +225,13 @@ func (h *RemoteHelper) handleRequest(
 	if returnHeaders == nil {
 		returnHeaders = make(map[string]string)
 	}
-	_ = h.sendResponse(stream, reqProto, statusCode, returnHeaders, body, sendMu)
+	_ = h.sendResponse(stream, reqProto, requestStart, statusCode, returnHeaders, body, sendMu)
 }
 
 func (h *RemoteHelper) sendResponse(
 	stream pb.HarpService_ProxyClient,
 	reqProto *pb.HTTPRequest,
+	requestStart time.Time,
 	statusCode int,
 	headers map[string]string,
 	body string,
@@ -241,7 +243,7 @@ func (h *RemoteHelper) sendResponse(
 		Body:      body,
 		RequestId: reqProto.RequestId,
 		Timestamp: time.Now().UnixNano(),
-		Latency:   time.Since(time.Unix(0, reqProto.Timestamp)).Nanoseconds(),
+		Latency:   time.Since(requestStart).Nanoseconds(),
 	}
 
 	if sendMu != nil {
