@@ -36,6 +36,7 @@ Unlike traditional reverse proxies (nginx, HAProxy, Traefik) that require the ba
 - [Examples](#examples)
 - [Using the Web Handler Wrapper](#using-the-web-handler-wrapper)
 - [HARP Gateway Agent](#harp-gateway-agent)
+- [Integration Guide](./INTEGRATION.md)
 - [License](#license)
 
 ---
