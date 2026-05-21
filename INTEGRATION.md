@@ -150,6 +150,7 @@ that doesn't need a full `net/http` stack.
 
 ```go
 import (
+    "fmt"
     "log"
     "net/http"
     "time"
