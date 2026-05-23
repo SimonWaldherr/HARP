@@ -2,10 +2,10 @@ module remote-helper-demo
 
 go 1.23
 
-require github.com/SimonWaldherr/HARP/harpserver v1.1.5
+require github.com/SimonWaldherr/HARP/harpserver v1.6.0
 
 require (
-	github.com/SimonWaldherr/HARP/harp v1.1.7 // indirect
+	github.com/SimonWaldherr/HARP/harp v1.6.0 // indirect
 	golang.org/x/net v0.32.0 // indirect
 	golang.org/x/sys v0.28.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
