@@ -41,6 +41,10 @@ type HelperRoute struct {
 	Handler HelperHandlerFunc
 	// StreamHandler is called for streaming routes and may emit multiple chunks.
 	StreamHandler HelperStreamHandlerFunc
+	// StreamType selects response defaults for streaming routes.
+	// Supported values are harp.StreamTypeChunked, harp.StreamTypeSSE,
+	// harp.StreamTypeNDJSON, and harp.StreamTypeText.
+	StreamType string
 }
 
 // RemoteHelper connects to a HARP proxy and dispatches incoming HTTP requests
@@ -76,7 +80,19 @@ func (h *RemoteHelper) Register(path, name string, fn HelperHandlerFunc) {
 // RegisterStream adds a streaming route handler that can emit multiple response
 // chunks for a single request.
 func (h *RemoteHelper) RegisterStream(path, name string, fn HelperStreamHandlerFunc) {
-	h.Routes = append(h.Routes, HelperRoute{Name: name, Path: path, StreamHandler: fn})
+	h.RegisterStreamType(path, name, pb.StreamTypeChunked, fn)
+}
+
+// RegisterStreamType adds a streaming route handler with an explicit stream
+// type. Use harp.StreamTypeSSE for Server-Sent Events, harp.StreamTypeNDJSON
+// for newline-delimited JSON, or harp.StreamTypeText for text streams.
+func (h *RemoteHelper) RegisterStreamType(path, name, streamType string, fn HelperStreamHandlerFunc) {
+	h.Routes = append(h.Routes, HelperRoute{Name: name, Path: path, StreamHandler: fn, StreamType: normalizeStreamType(streamType)})
+}
+
+// RegisterSSE adds a Server-Sent Events route handler.
+func (h *RemoteHelper) RegisterSSE(path, name string, fn HelperStreamHandlerFunc) {
+	h.RegisterStreamType(path, name, pb.StreamTypeSSE, fn)
 }
 
 // ListenAndServe connects to the HARP proxy, registers all routes, and
@@ -195,6 +211,7 @@ func (h *RemoteHelper) handleRequest(
 				headers = make(map[string]string)
 			}
 			headers[pb.StreamHeader] = "1"
+			headers[pb.StreamTypeHeader] = normalizeStreamType(matched.StreamType)
 			if end {
 				headers[pb.StreamEndHeader] = "1"
 			}

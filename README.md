@@ -263,6 +263,13 @@ The **demos/** folder includes several backend examples:
    Exposes local Ollama / LM Studio / llmster endpoints through your public
    HARP proxy (on any public host) using `harp-gateway` JSON config only.
 
+7. **SSE Demo (demos/sse-go):**
+   Streams Server-Sent Events through HARP with `RemoteHelper.RegisterSSE`.
+
+8. **WebSocket Demo (demos/websocket-go):**
+   Shows a direct WebSocket echo server and documents why WebSocket proxying
+   needs a future full-duplex HARP tunnel.
+
 ---
 
 ## Using the Web Handler Wrapper
@@ -280,11 +287,21 @@ server := &harpserver.BackendServer{
     Routes: []harpserver.RouteConfig{
         {Name: "API",    Path: "/api/",  Handler: apiRouter},
         {Name: "Static", Path: "/static/", Handler: staticHandler},
+        {
+            Name:       "Events",
+            Path:       "/events/",
+            Handler:    sseHandler,
+            Streaming:  true,
+            StreamType: "sse",
+        },
     },
     ReconnectInterval: 5 * time.Second, // auto-reconnect on disconnect
 }
 server.ListenAndServeHarp()
 ```
+
+Streaming routes support `http.Flusher`; SSE handlers can write `data: ...\n\n`
+events and call `Flush()` just like they would behind a normal Go HTTP server.
 
 ---
 
@@ -352,6 +369,7 @@ make build-gateway
       "upstream": "http://localhost:8123",
       "stripPrefix": true,
       "streaming": true,
+      "streamingType": "sse",
       "addHeaders": {
         "Authorization": "Bearer YOUR_HA_TOKEN"
       },
@@ -382,6 +400,7 @@ make build-gateway
 | `upstream` | string | *required* | Local HTTP base URL to forward requests to |
 | `stripPrefix` | bool | `false` | Remove the route prefix before forwarding (e.g. `/pihole/admin/index` → `/admin/index`) |
 | `streaming` | bool | `false` | Enable chunked streaming relay for long-lived responses (SSE/token streams) |
+| `streamingType` | string | `chunked` | Stream response defaults: `chunked`, `sse`, `ndjson`, or `text`; setting it also enables streaming |
 | `addHeaders` | object | `{}` | Extra headers injected into every upstream request (auth tokens, API keys, …) |
 | `timeoutSeconds` | int | `30` | Per-request timeout for the upstream call |
 

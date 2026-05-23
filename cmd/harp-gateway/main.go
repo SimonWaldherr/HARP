@@ -70,6 +70,8 @@ type ServiceConfig struct {
 	TimeoutSeconds int `json:"timeoutSeconds"`
 	// Streaming enables chunked forwarding for long-lived responses (SSE/token streams).
 	Streaming bool `json:"streaming"`
+	// StreamingType selects streaming response defaults: chunked, sse, ndjson, or text.
+	StreamingType string `json:"streamingType"`
 }
 
 func main() {
@@ -140,8 +142,8 @@ func main() {
 
 		log.Printf("Registering service %q: %s -> %s (stripPrefix=%v)", svc.Name, svc.Route, svc.Upstream, svc.StripPrefix)
 
-		if svc.Streaming {
-			helper.RegisterStream(svc.Route, svc.Name, func(
+		if svc.Streaming || svc.StreamingType != "" {
+			helper.RegisterStreamType(svc.Route, svc.Name, svc.StreamingType, func(
 				r *http.Request,
 				send func(statusCode int, headers map[string]string, body string, end bool) error,
 			) error {

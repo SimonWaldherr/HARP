@@ -963,6 +963,9 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		isStream := headerEnabled(resp.Headers, pb.StreamHeader)
 		firstStatus := int(resp.Status)
 		firstHeaders := filterInternalHeaders(resp.Headers)
+		if isStream {
+			applyStreamDefaults(firstHeaders, streamType(resp.Headers))
+		}
 		var bodyBuilder strings.Builder
 		wroteHeaders := false
 		for {
@@ -1077,14 +1080,66 @@ func secureCompare(got, want string) bool {
 }
 
 func headerEnabled(headers map[string]string, key string) bool {
-	val := strings.TrimSpace(strings.ToLower(headers[key]))
+	val := strings.TrimSpace(strings.ToLower(headerValue(headers, key)))
 	return val == "1" || val == "true" || val == "yes"
+}
+
+func headerValue(headers map[string]string, key string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, key) {
+			return v
+		}
+	}
+	return ""
+}
+
+func streamType(headers map[string]string) string {
+	switch strings.ToLower(strings.TrimSpace(headerValue(headers, pb.StreamTypeHeader))) {
+	case pb.StreamTypeSSE:
+		return pb.StreamTypeSSE
+	case pb.StreamTypeNDJSON:
+		return pb.StreamTypeNDJSON
+	case pb.StreamTypeText:
+		return pb.StreamTypeText
+	default:
+		return pb.StreamTypeChunked
+	}
+}
+
+func applyStreamDefaults(headers map[string]string, typ string) {
+	deleteHeader(headers, "Content-Length")
+	switch typ {
+	case pb.StreamTypeSSE:
+		setHeaderDefault(headers, "Content-Type", "text/event-stream")
+		setHeaderDefault(headers, "Cache-Control", "no-cache")
+		setHeaderDefault(headers, "X-Accel-Buffering", "no")
+	case pb.StreamTypeNDJSON:
+		setHeaderDefault(headers, "Content-Type", "application/x-ndjson")
+	case pb.StreamTypeText:
+		setHeaderDefault(headers, "Content-Type", "text/plain; charset=utf-8")
+	}
+}
+
+func setHeaderDefault(headers map[string]string, key, value string) {
+	if headerValue(headers, key) == "" {
+		headers[key] = value
+	}
+}
+
+func deleteHeader(headers map[string]string, key string) {
+	for k := range headers {
+		if strings.EqualFold(k, key) {
+			delete(headers, k)
+		}
+	}
 }
 
 func filterInternalHeaders(headers map[string]string) map[string]string {
 	out := make(map[string]string, len(headers))
 	for k, v := range headers {
-		if strings.EqualFold(k, pb.StreamHeader) || strings.EqualFold(k, pb.StreamEndHeader) {
+		if strings.EqualFold(k, pb.StreamHeader) ||
+			strings.EqualFold(k, pb.StreamEndHeader) ||
+			strings.EqualFold(k, pb.StreamTypeHeader) {
 			continue
 		}
 		out[k] = v

@@ -148,6 +148,27 @@ func TestRemoteHelperRegisterStream(t *testing.T) {
 	if h.Routes[0].StreamHandler == nil {
 		t.Fatal("expected StreamHandler to be set")
 	}
+	if h.Routes[0].StreamType != pb.StreamTypeChunked {
+		t.Fatalf("expected default stream type %q, got %q", pb.StreamTypeChunked, h.Routes[0].StreamType)
+	}
+}
+
+func TestRemoteHelperRegisterSSE(t *testing.T) {
+	h := &RemoteHelper{Name: "sse-test"}
+
+	h.RegisterSSE("/events", "Events", func(
+		r *http.Request,
+		send func(statusCode int, headers map[string]string, body string, end bool) error,
+	) error {
+		return send(http.StatusOK, nil, "data: ok\n\n", true)
+	})
+
+	if len(h.Routes) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(h.Routes))
+	}
+	if h.Routes[0].StreamType != pb.StreamTypeSSE {
+		t.Fatalf("expected stream type %q, got %q", pb.StreamTypeSSE, h.Routes[0].StreamType)
+	}
 }
 
 // TestBackendServerRouteConfig checks that RouteConfig fields are stored correctly.

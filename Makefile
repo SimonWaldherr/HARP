@@ -1,6 +1,7 @@
 .PHONY: all build build-proxy build-gateway build-demos fmt fmt-all vet vet-all lint test test-all test-verbose test-cover \
-       run run-proxy run-gateway run-demo-simple run-demo-complex run-demo-enhanced \
-       run-demo-multi run-demo-remote-helper run-demo-static demo demo-admin clean proto help
+run run-proxy run-gateway run-demo-simple run-demo-complex run-demo-enhanced \
+       run-demo-multi run-demo-remote-helper run-demo-static run-demo-sse \
+       run-demo-websocket demo demo-admin clean proto help
 
 # ── Variables ────────────────────────────────────────────────────────────────
 BINARY       := bin/harp-proxy
@@ -13,7 +14,7 @@ GATEWAY_CFG  ?= cmd/harp-gateway/gateway-example.json
 PROXY_ADDR   ?= localhost:50054
 
 # Demo binaries
-DEMOS := simple-go complex-harp-server enhanced-go multi-service-go static-wrapper-go
+DEMOS := simple-go complex-harp-server enhanced-go multi-service-go static-wrapper-go sse-go websocket-go
 MODULE_DIRS := . harp harpserver demos/remote-helper-go demos/advanced-enterprise
 
 # ── Default target ───────────────────────────────────────────────────────────
@@ -109,6 +110,12 @@ run-demo-remote-helper: ## Run the remote-helper-go demo
 
 run-demo-static: ## Run the static-wrapper-go demo
 	$(GO) run ./demos/static-wrapper-go -proxy $(PROXY_ADDR)
+
+run-demo-sse: ## Run the SSE streaming demo (proxy must be running)
+	$(GO) run ./demos/sse-go -proxy $(PROXY_ADDR)
+
+run-demo-websocket: ## Run the direct WebSocket demo
+	$(GO) run ./demos/websocket-go
 
 # ── Demo: full workflow ──────────────────────────────────────────────────────
 demo: build-proxy ## Run proxy + simple demo, then curl a test request

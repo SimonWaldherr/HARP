@@ -35,6 +35,7 @@
       "route": "/api/",
       "upstream": "http://localhost:9000",
       "stripPrefix": false,
+      "streamingType": "sse",
       "timeoutSeconds": 60
     }
   ]

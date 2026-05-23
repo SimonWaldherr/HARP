@@ -428,6 +428,7 @@ func TestHeaderEnabled(t *testing.T) {
 		{"true", map[string]string{"X-Test": "true"}, true},
 		{"yes", map[string]string{"X-Test": "yes"}, true},
 		{"false", map[string]string{"X-Test": "false"}, false},
+		{"case-insensitive", map[string]string{"x-test": "1"}, true},
 		{"missing", map[string]string{}, false},
 	}
 	for _, tc := range tests {
@@ -442,6 +443,7 @@ func TestFilterInternalHeaders(t *testing.T) {
 		"Content-Type":      "text/event-stream",
 		pb.StreamHeader:     "1",
 		pb.StreamEndHeader:  "1",
+		pb.StreamTypeHeader: pb.StreamTypeSSE,
 		"X-Another-Header":  "ok",
 		"x-harp-stream-end": "1",
 	}
@@ -460,6 +462,30 @@ func TestFilterInternalHeaders(t *testing.T) {
 	}
 	if _, ok := filtered["x-harp-stream-end"]; ok {
 		t.Fatalf("expected case-insensitive stream-end header to be removed")
+	}
+	if _, ok := filtered[pb.StreamTypeHeader]; ok {
+		t.Fatalf("expected %s to be removed", pb.StreamTypeHeader)
+	}
+}
+
+func TestApplyStreamDefaults(t *testing.T) {
+	headers := map[string]string{"Content-Length": "100"}
+	applyStreamDefaults(headers, pb.StreamTypeSSE)
+
+	if headers["Content-Type"] != "text/event-stream" {
+		t.Fatalf("expected SSE content type, got %q", headers["Content-Type"])
+	}
+	if headers["Cache-Control"] != "no-cache" {
+		t.Fatalf("expected no-cache cache control, got %q", headers["Cache-Control"])
+	}
+	if _, ok := headers["Content-Length"]; ok {
+		t.Fatal("expected Content-Length to be removed for streams")
+	}
+
+	headers = map[string]string{"Content-Type": "application/json"}
+	applyStreamDefaults(headers, pb.StreamTypeNDJSON)
+	if headers["Content-Type"] != "application/json" {
+		t.Fatalf("expected existing content type to be preserved")
 	}
 }
 

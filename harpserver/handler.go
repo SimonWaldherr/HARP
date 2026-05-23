@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	pb "github.com/SimonWaldherr/HARP/harp"
@@ -20,9 +21,11 @@ import (
 // It is used by BackendServer to register multiple routes, each served
 // by a different http.Handler.
 type RouteConfig struct {
-	Name    string
-	Path    string
-	Handler http.Handler
+	Name       string
+	Path       string
+	Handler    http.Handler
+	Streaming  bool
+	StreamType string
 }
 
 // BackendServer wraps an HTTP handler so that it can register with HARP.
@@ -35,6 +38,11 @@ type BackendServer struct {
 	Key      string
 	Handler  http.Handler
 	ProxyURL string
+	// Streaming enables flush-aware response streaming for the single
+	// Route/Handler configuration.
+	Streaming bool
+	// StreamType selects response defaults for streaming responses.
+	StreamType string
 	// Routes registers multiple path→handler mappings.
 	// When set, the single Route/Handler fields are ignored.
 	Routes []RouteConfig
@@ -82,7 +90,7 @@ func (s *BackendServer) connect() error {
 	}
 
 	// Build route list and per-path handler map.
-	routeMap := make(map[string]http.Handler)
+	routeMap := make(map[string]RouteConfig)
 	var protoRoutes []*pb.Route
 	if len(s.Routes) > 0 {
 		for _, r := range s.Routes {
@@ -91,7 +99,8 @@ func (s *BackendServer) connect() error {
 				Path:   r.Path,
 				Domain: s.Domain,
 			})
-			routeMap[r.Path] = r.Handler
+			r.StreamType = normalizeStreamType(r.StreamType)
+			routeMap[r.Path] = r
 		}
 	} else {
 		protoRoutes = []*pb.Route{{
@@ -99,7 +108,13 @@ func (s *BackendServer) connect() error {
 			Path:   s.Route,
 			Domain: s.Domain,
 		}}
-		routeMap[s.Route] = s.Handler
+		routeMap[s.Route] = RouteConfig{
+			Name:       s.Name,
+			Path:       s.Route,
+			Handler:    s.Handler,
+			Streaming:  s.Streaming,
+			StreamType: normalizeStreamType(s.StreamType),
+		}
 	}
 
 	reg := &pb.Registration{
@@ -115,6 +130,8 @@ func (s *BackendServer) connect() error {
 	}
 	log.Printf("Backend %s registered with %d route(s)", s.Name, len(protoRoutes))
 
+	var sendMu sync.Mutex
+
 	// Listen for forwarded HTTP requests.
 	for {
 		msg, err := stream.Recv()
@@ -126,50 +143,114 @@ func (s *BackendServer) connect() error {
 			continue
 		}
 		log.Printf("Backend %s received request for %s", s.Name, reqProto.Url)
+		go s.handleRequest(stream, reqProto, routeMap, &sendMu)
+	}
+}
 
-		// Convert proto HTTPRequest to http.Request.
-		req, err := convertProtoToHTTPRequest(reqProto)
-		if err != nil {
-			log.Printf("Error converting request: %v", err)
-			continue
-		}
+func (s *BackendServer) handleRequest(
+	stream pb.HarpService_ProxyClient,
+	reqProto *pb.HTTPRequest,
+	routeMap map[string]RouteConfig,
+	sendMu *sync.Mutex,
+) {
+	// Convert proto HTTPRequest to http.Request.
+	req, err := convertProtoToHTTPRequest(reqProto)
+	if err != nil {
+		log.Printf("Error converting request: %v", err)
+		return
+	}
 
-		// Dispatch to the best-matching handler (longest prefix wins).
-		handler := s.Handler
-		if len(routeMap) > 0 {
-			var bestLen int
-			for path, h := range routeMap {
-				if strings.HasPrefix(req.URL.Path, path) && len(path) > bestLen {
-					handler = h
-					bestLen = len(path)
-				}
+	// Dispatch to the best-matching handler (longest prefix wins).
+	route := RouteConfig{
+		Name:       s.Name,
+		Path:       s.Route,
+		Handler:    s.Handler,
+		Streaming:  s.Streaming,
+		StreamType: normalizeStreamType(s.StreamType),
+	}
+	if len(routeMap) > 0 {
+		var bestLen int
+		for path, candidate := range routeMap {
+			if strings.HasPrefix(req.URL.Path, path) && len(path) > bestLen {
+				route = candidate
+				bestLen = len(path)
 			}
 		}
+	}
 
-		// Create a response recorder.
-		recorder := newResponseRecorder()
-		if handler != nil {
-			handler.ServeHTTP(recorder, req)
-		} else {
-			recorder.WriteHeader(http.StatusNotFound)
+	if route.Streaming {
+		s.handleStreamingRequest(stream, reqProto, req, route, sendMu)
+		return
+	}
+
+	// Create a response recorder.
+	recorder := newResponseRecorder()
+	if route.Handler != nil {
+		route.Handler.ServeHTTP(recorder, req)
+	} else {
+		recorder.WriteHeader(http.StatusNotFound)
+	}
+
+	// Build HTTPResponse proto.
+	respProto := &pb.HTTPResponse{
+		Status:    int32(recorder.code),
+		Headers:   headerToMap(recorder.HeaderMap),
+		Body:      recorder.Body.String(),
+		RequestId: reqProto.RequestId,
+		Timestamp: time.Now().UnixNano(),
+		Cacheable: false,
+		Latency:   time.Since(time.Unix(0, reqProto.Timestamp)).Nanoseconds(),
+	}
+
+	sendMu.Lock()
+	defer sendMu.Unlock()
+	if err := stream.Send(&pb.ClientMessage{
+		Payload: &pb.ClientMessage_HttpResponse{HttpResponse: respProto},
+	}); err != nil {
+		log.Printf("Error sending response: %v", err)
+	}
+}
+
+func (s *BackendServer) handleStreamingRequest(
+	stream pb.HarpService_ProxyClient,
+	reqProto *pb.HTTPRequest,
+	req *http.Request,
+	route RouteConfig,
+	sendMu *sync.Mutex,
+) {
+	requestStart := time.Unix(0, reqProto.Timestamp)
+	send := func(statusCode int, headers map[string]string, body string, end bool) error {
+		if headers == nil {
+			headers = make(map[string]string)
 		}
-
-		// Build HTTPResponse proto.
+		headers[pb.StreamHeader] = "1"
+		headers[pb.StreamTypeHeader] = normalizeStreamType(route.StreamType)
+		if end {
+			headers[pb.StreamEndHeader] = "1"
+		}
 		respProto := &pb.HTTPResponse{
-			Status:    int32(recorder.code),
-			Headers:   headerToMap(recorder.HeaderMap),
-			Body:      recorder.Body.String(),
+			Status:    int32(statusCode),
+			Headers:   headers,
+			Body:      body,
 			RequestId: reqProto.RequestId,
 			Timestamp: time.Now().UnixNano(),
 			Cacheable: false,
-			Latency:   time.Since(time.Unix(0, reqProto.Timestamp)).Nanoseconds(),
+			Latency:   time.Since(requestStart).Nanoseconds(),
 		}
-
-		if err := stream.Send(&pb.ClientMessage{
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return stream.Send(&pb.ClientMessage{
 			Payload: &pb.ClientMessage_HttpResponse{HttpResponse: respProto},
-		}); err != nil {
-			log.Printf("Error sending response: %v", err)
-		}
+		})
+	}
+	writer := newStreamingResponseWriter(send)
+	if route.Handler != nil {
+		route.Handler.ServeHTTP(writer, req)
+	} else {
+		writer.WriteHeader(http.StatusNotFound)
+	}
+	if err := writer.Close(); err != nil {
+		log.Printf("Error sending streaming response: %v", err)
 	}
 }
 

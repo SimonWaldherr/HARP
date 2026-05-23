@@ -72,7 +72,8 @@ make build-gateway
 | `route` | Public path prefix clients will use |
 | `upstream` | Local address of your existing service |
 | `stripPrefix` | Remove the route prefix before forwarding |
-| `streaming` | Set `true` for SSE / token-stream responses |
+| `streaming` | Set `true` for chunked/token-stream responses |
+| `streamingType` | Optional stream defaults: `chunked`, `sse`, `ndjson`, or `text`; setting it enables streaming |
 | `addHeaders` | Headers injected into every upstream request |
 
 ### 3. Run the gateway
@@ -170,12 +171,12 @@ helper.Register("/helper/ping", "Ping", func(r *http.Request) (int, map[string]s
     return 200, map[string]string{"Content-Type": "text/plain"}, "pong"
 })
 
-// Register a streaming route (SSE / chunked output).
-helper.RegisterStream("/helper/stream", "Stream", func(r *http.Request,
+// Register a Server-Sent Events route.
+helper.RegisterSSE("/helper/events", "Events", func(r *http.Request,
     send func(int, map[string]string, string, bool) error) error {
 
     for i := 0; i < 5; i++ {
-        _ = send(200, map[string]string{"Content-Type": "text/plain"}, fmt.Sprintf("chunk %d\n", i), false)
+        _ = send(200, nil, fmt.Sprintf("data: chunk %d\n\n", i), false)
         time.Sleep(500 * time.Millisecond)
     }
     return send(200, nil, "", true) // signal end-of-stream

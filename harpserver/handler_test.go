@@ -36,6 +36,49 @@ func TestResponseRecorder(t *testing.T) {
 	}
 }
 
+func TestStreamingResponseWriterFlushesChunks(t *testing.T) {
+	type sentChunk struct {
+		status  int
+		headers map[string]string
+		body    string
+		end     bool
+	}
+	var chunks []sentChunk
+	writer := newStreamingResponseWriter(func(statusCode int, headers map[string]string, body string, end bool) error {
+		chunks = append(chunks, sentChunk{status: statusCode, headers: headers, body: body, end: end})
+		return nil
+	})
+
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.WriteHeader(http.StatusAccepted)
+	if _, err := writer.Write([]byte("data: one\n\n")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	writer.Flush()
+	if _, err := writer.Write([]byte("data: two\n\n")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	if len(chunks) != 3 {
+		t.Fatalf("expected 3 chunks, got %d", len(chunks))
+	}
+	if chunks[0].status != http.StatusAccepted {
+		t.Fatalf("expected status %d, got %d", http.StatusAccepted, chunks[0].status)
+	}
+	if chunks[0].headers["Content-Type"] != "text/event-stream" {
+		t.Fatalf("expected first chunk headers to include content type")
+	}
+	if chunks[1].headers != nil {
+		t.Fatalf("expected second chunk to omit repeated headers")
+	}
+	if !chunks[2].end {
+		t.Fatal("expected final chunk to be marked as end")
+	}
+}
+
 func TestResponseRecorderMultipleWrites(t *testing.T) {
 	rr := newResponseRecorder()
 	rr.Write([]byte("foo"))
