@@ -451,6 +451,8 @@ var (
 	// Pending responses keyed by request ID.
 	pendingMu       sync.RWMutex
 	pendingResponse = make(map[string]chan *pb.HTTPResponse)
+	pendingWSMu     sync.RWMutex
+	pendingWS       = make(map[string]*proxyWebSocketTunnel)
 	startTime       time.Time
 	requestSem      chan struct{}
 )
@@ -724,6 +726,18 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 			}
 			httpResp := clientMsg.GetHttpResponse()
 			if httpResp == nil {
+				wsData := clientMsg.GetWebsocketData()
+				if wsData == nil {
+					continue
+				}
+				pendingWSMu.RLock()
+				tunnel, ok := pendingWS[wsData.RequestId]
+				pendingWSMu.RUnlock()
+				if ok {
+					deliverPendingWebSocket(stream.Context(), wsData, tunnel)
+				} else {
+					logDebug("No pending WebSocket for request ID %s", wsData.RequestId)
+				}
 				continue
 			}
 			pendingMu.RLock()
@@ -791,6 +805,14 @@ func isRegistrationAllowed(path, key string) bool {
 }
 
 func deliverPendingResponse(ctx context.Context, resp *pb.HTTPResponse, ch chan<- *pb.HTTPResponse) bool {
+	if headerEnabled(resp.Headers, pb.StreamHeader) {
+		select {
+		case ch <- resp:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
 	select {
 	case ch <- resp:
 		return true
@@ -801,6 +823,17 @@ func deliverPendingResponse(ctx context.Context, resp *pb.HTTPResponse, ch chan<
 		if metrics != nil {
 			metrics.BackendErrors.Add(1)
 		}
+		return false
+	}
+}
+
+func deliverPendingWebSocket(ctx context.Context, data *pb.WebSocketData, tunnel *proxyWebSocketTunnel) bool {
+	select {
+	case tunnel.ch <- data:
+		return true
+	case <-tunnel.done:
+		return false
+	case <-ctx.Done():
 		return false
 	}
 }
@@ -898,6 +931,11 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		delete(headers, "Authorization")
 	}
 
+	if isWebSocketUpgrade(r) {
+		handleWebSocket(w, r, chosen, headers)
+		return
+	}
+
 	cacheKey := getCacheKey(r.Method, r.URL.String(), headers, bodyStr)
 	if config.EnableCache && strings.ToUpper(r.Method) == "GET" && config.CacheType != "none" {
 		if resp, ok := cacheStore.Get(cacheKey); ok {
@@ -935,7 +973,7 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// Send the HTTPRequest to the chosen backend.
-	serverMsg := &pb.ServerMessage{HttpRequest: httpReq}
+	serverMsg := &pb.ServerMessage{Payload: &pb.ServerMessage_HttpRequest{HttpRequest: httpReq}}
 	chosen.mu.Lock()
 	err = chosen.stream.Send(serverMsg)
 	chosen.mu.Unlock()

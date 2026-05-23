@@ -66,7 +66,9 @@ type ServiceConfig struct {
 	StripPrefix bool `json:"stripPrefix"`
 	// AddHeaders are extra headers added to every request forwarded to the upstream.
 	AddHeaders map[string]string `json:"addHeaders"`
-	// TimeoutSeconds is the per-request timeout for the upstream call (default 30).
+	// TimeoutSeconds is the per-request timeout for the upstream call.
+	// Non-streaming routes default to 30 seconds. Streaming routes use no
+	// timeout when this is 0, which is useful for long-running live generation.
 	TimeoutSeconds int `json:"timeoutSeconds"`
 	// Streaming enables chunked forwarding for long-lived responses (SSE/token streams).
 	Streaming bool `json:"streaming"`

@@ -24,6 +24,13 @@ message HTTPResponse {
   int64 latency = 7;
 }
 
+// Raw bytes exchanged after a WebSocket HTTP upgrade.
+message WebSocketData {
+  string requestId = 1;
+  bytes data = 2;
+  bool close = 3;
+}
+
 // Registration info sent by the backend.
 message Registration {
   string name = 1;
@@ -45,12 +52,16 @@ message ClientMessage {
   oneof payload {
     Registration registration = 1;
     HTTPResponse httpResponse = 2;
+    WebSocketData websocketData = 3;
   }
 }
 
 // Message sent from the proxy (server) to the backend.
 message ServerMessage {
-  HTTPRequest httpRequest = 1;
+  oneof payload {
+    HTTPRequest httpRequest = 1;
+    WebSocketData websocketData = 2;
+  }
 }
 
 // Bidirectional streaming RPC.

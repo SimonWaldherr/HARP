@@ -1,9 +1,7 @@
 // demos/websocket-go/app.go
 //
 // This is a minimal WebSocket echo server implemented with the Go standard
-// library. It is intentionally direct HTTP, not HARP-proxied: the current HARP
-// transport supports HTTP request/response and server-to-client response
-// streaming, but not full-duplex WebSocket upgrade tunneling yet.
+// library and exposed through HARP's BackendServer wrapper.
 package main
 
 import (
@@ -19,11 +17,17 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/SimonWaldherr/HARP/harpserver"
 )
 
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-var addr = flag.String("addr", ":8091", "HTTP listen address")
+var (
+	addr      = flag.String("addr", ":8091", "HTTP listen address for -direct")
+	proxyAddr = flag.String("proxy", "localhost:50054", "Address of the HARP proxy gRPC server")
+	direct    = flag.Bool("direct", false, "Run as a direct local HTTP server instead of a HARP backend")
+)
 
 func main() {
 	flag.Parse()
@@ -31,11 +35,28 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", indexHandler)
 	mux.HandleFunc("/ws", websocketHandler)
-	mux.HandleFunc("/harp-note", harpNoteHandler)
 
-	log.Printf("WebSocket demo listening on http://localhost%s", *addr)
-	log.Println("Open http://localhost:8091/ in a browser")
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	if *direct {
+		log.Printf("WebSocket demo listening directly on http://localhost%s", *addr)
+		log.Println("Open http://localhost:8091/ in a browser")
+		log.Fatal(http.ListenAndServe(*addr, mux))
+	}
+
+	server := &harpserver.BackendServer{
+		Name:              "WebSocketDemo",
+		Domain:            ".*",
+		Route:             "/",
+		Key:               "master-key",
+		Handler:           mux,
+		ProxyURL:          *proxyAddr,
+		ReconnectInterval: 5 * time.Second,
+	}
+
+	log.Printf("WebSocket demo connecting to HARP proxy at %s", *proxyAddr)
+	log.Println("Open http://localhost:8080/ after the HARP proxy accepts this backend")
+	if err := server.ListenAndServeHarp(); err != nil {
+		log.Fatalf("WebSocket demo failed: %v", err)
+	}
 }
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +66,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 <head><meta charset="utf-8"><title>HARP WebSocket Demo</title></head>
 <body>
 <h1>WebSocket Echo Demo</h1>
-<p>This endpoint is direct HTTP. HARP does not proxy full-duplex WebSocket upgrades yet.</p>
+<p>This WebSocket runs through HARP when the demo is started without -direct.</p>
 <pre id="log"></pre>
 <script>
 const log = document.getElementById("log");
@@ -60,13 +81,6 @@ ws.onerror = () => log.textContent += "error\n";
 </script>
 </body>
 </html>`)
-}
-
-func harpNoteHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusUpgradeRequired)
-	fmt.Fprintln(w, "WebSocket requires full-duplex HTTP upgrade tunneling.")
-	fmt.Fprintln(w, "The current HARP transport supports SSE and chunked response streaming, but not WebSocket proxying yet.")
 }
 
 func websocketHandler(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +104,7 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Time{})
 
 	accept := websocketAccept(key)
 	fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\n")

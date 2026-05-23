@@ -438,6 +438,52 @@ func TestHeaderEnabled(t *testing.T) {
 	}
 }
 
+func TestIsWebSocketUpgrade(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+	req.Header.Set("Connection", "keep-alive, Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	if !isWebSocketUpgrade(req) {
+		t.Fatal("expected WebSocket upgrade to be detected")
+	}
+
+	req.Header.Set("Connection", "keep-alive")
+	if isWebSocketUpgrade(req) {
+		t.Fatal("expected request without upgrade connection token to be rejected")
+	}
+}
+
+func TestDeliverPendingResponseStreamsUseBackpressure(t *testing.T) {
+	ch := make(chan *pb.HTTPResponse)
+	resp := &pb.HTTPResponse{
+		RequestId: "stream-1",
+		Headers:   map[string]string{pb.StreamHeader: "1"},
+	}
+	done := make(chan bool, 1)
+
+	go func() {
+		done <- deliverPendingResponse(context.Background(), resp, ch)
+	}()
+
+	got := <-ch
+	if got != resp {
+		t.Fatal("expected streamed response to be delivered")
+	}
+	if ok := <-done; !ok {
+		t.Fatal("expected streamed response delivery to succeed")
+	}
+}
+
+func TestDeliverPendingResponseDropsFullNonStreamChannel(t *testing.T) {
+	ch := make(chan *pb.HTTPResponse, 1)
+	ch <- &pb.HTTPResponse{RequestId: "existing"}
+
+	ok := deliverPendingResponse(context.Background(), &pb.HTTPResponse{RequestId: "non-stream"}, ch)
+	if ok {
+		t.Fatal("expected non-stream response delivery to fail when channel is full")
+	}
+}
+
 func TestFilterInternalHeaders(t *testing.T) {
 	headers := map[string]string{
 		"Content-Type":      "text/event-stream",

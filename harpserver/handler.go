@@ -131,6 +131,8 @@ func (s *BackendServer) connect() error {
 	log.Printf("Backend %s registered with %d route(s)", s.Name, len(protoRoutes))
 
 	var sendMu sync.Mutex
+	wsTunnels := make(map[string]*webSocketTunnel)
+	var wsMu sync.RWMutex
 
 	// Listen for forwarded HTTP requests.
 	for {
@@ -138,12 +140,24 @@ func (s *BackendServer) connect() error {
 		if err != nil {
 			return err
 		}
+		if wsData := msg.GetWebsocketData(); wsData != nil {
+			wsMu.RLock()
+			tunnel, ok := wsTunnels[wsData.RequestId]
+			wsMu.RUnlock()
+			if ok {
+				select {
+				case tunnel.ch <- wsData:
+				case <-tunnel.done:
+				}
+			}
+			continue
+		}
 		reqProto := msg.GetHttpRequest()
 		if reqProto == nil {
 			continue
 		}
 		log.Printf("Backend %s received request for %s", s.Name, reqProto.Url)
-		go s.handleRequest(stream, reqProto, routeMap, &sendMu)
+		go s.handleRequest(stream, reqProto, routeMap, &sendMu, wsTunnels, &wsMu)
 	}
 }
 
@@ -152,6 +166,8 @@ func (s *BackendServer) handleRequest(
 	reqProto *pb.HTTPRequest,
 	routeMap map[string]RouteConfig,
 	sendMu *sync.Mutex,
+	wsTunnels map[string]*webSocketTunnel,
+	wsMu *sync.RWMutex,
 ) {
 	// Convert proto HTTPRequest to http.Request.
 	req, err := convertProtoToHTTPRequest(reqProto)
@@ -178,6 +194,10 @@ func (s *BackendServer) handleRequest(
 		}
 	}
 
+	if isWebSocketUpgrade(req) {
+		s.handleWebSocketRequest(stream, reqProto, req, route, sendMu, wsTunnels, wsMu)
+		return
+	}
 	if route.Streaming {
 		s.handleStreamingRequest(stream, reqProto, req, route, sendMu)
 		return

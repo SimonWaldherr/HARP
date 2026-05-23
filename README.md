@@ -267,8 +267,7 @@ The **demos/** folder includes several backend examples:
    Streams Server-Sent Events through HARP with `RemoteHelper.RegisterSSE`.
 
 8. **WebSocket Demo (demos/websocket-go):**
-   Shows a direct WebSocket echo server and documents why WebSocket proxying
-   needs a future full-duplex HARP tunnel.
+   Exposes a WebSocket echo server through HARP's full-duplex upgrade tunnel.
 
 ---
 

@@ -92,6 +92,8 @@ connection drops.
 
 If your application is written in Go and already uses `net/http`, you can
 replace your `http.ListenAndServe` call with `server.ListenAndServeHarp()`.
+HARP forwards regular HTTP, streaming responses, and WebSocket upgrades for
+handlers that use `http.Hijacker` such as Gorilla WebSocket.
 
 ### Before
 
@@ -123,6 +125,22 @@ log.Fatal(server.ListenAndServeHarp())
 
 Your handler receives normal `*http.Request` objects and writes to a standard
 `http.ResponseWriter` — no other changes required.
+
+WebSocket endpoints work through the same wrapper:
+
+```go
+router.HandleFunc("/ws", websocketHandler)
+
+server := &harpserver.BackendServer{
+    Name:     "RealtimeApp",
+    ProxyURL: "proxy.example.com:50054",
+    Key:      "my-secret-key",
+    Domain:   ".*",
+    Route:    "/",
+    Handler:  router,
+}
+log.Fatal(server.ListenAndServeHarp())
+```
 
 ### Multiple routes
 
