@@ -249,18 +249,28 @@ ClientMessage {
 ```
 for msg in stream:
     req = msg.http_request
-    # process req.method, req.url, req.headers, req.body
+    # process req.method and req.url
+    # Prefer req.header_values and req.body_bytes.
+    # req.headers and req.body are compatibility fields for older peers.
 
     stream.send(ClientMessage {
         http_response: HTTPResponse {
             status:     200,
             headers:    { "Content-Type": "text/plain" },
+            header_values: [
+                HTTPHeader { name: "Content-Type", values: ["text/plain"] }
+            ],
             body:       "Hello from my backend",
+            body_bytes: b"Hello from my backend",
             request_id: req.request_id,
             timestamp:  time.now_nanos(),
         }
     })
 ```
+
+Use `header_values` when a header can appear more than once, for example
+`Set-Cookie`. Use `body_bytes` for binary payloads or any body that is not
+guaranteed to be UTF-8.
 
 The connection is persistent. Reconnect and re-send the Registration message
 whenever the stream drops.

@@ -255,12 +255,14 @@ func (h *RemoteHelper) sendResponse(
 	sendMu *sync.Mutex,
 ) error {
 	respProto := &pb.HTTPResponse{
-		Status:    int32(statusCode),
-		Headers:   headers,
-		Body:      body,
-		RequestId: reqProto.RequestId,
-		Timestamp: time.Now().UnixNano(),
-		Latency:   time.Since(requestStart).Nanoseconds(),
+		Status:       int32(statusCode),
+		Headers:      headers,
+		HeaderValues: pb.HeaderValuesFromHTTP(pb.HTTPHeaderFromProto(headers, nil)),
+		Body:         body,
+		BodyBytes:    []byte(body),
+		RequestId:    reqProto.RequestId,
+		Timestamp:    time.Now().UnixNano(),
+		Latency:      time.Since(requestStart).Nanoseconds(),
 	}
 
 	if sendMu != nil {

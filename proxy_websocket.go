@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -35,7 +34,7 @@ func headerTokenContains(header, token string) bool {
 	return false
 }
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request, chosen *backendConn, headers map[string]string) {
+func handleWebSocket(w http.ResponseWriter, r *http.Request, chosen *backendConn, headers map[string]string, headerValues []*pb.HTTPHeader) {
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "WebSocket upgrade not supported", http.StatusInternalServerError)
@@ -66,11 +65,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, chosen *backendConn
 	}()
 
 	httpReq := &pb.HTTPRequest{
-		Method:    r.Method,
-		Url:       r.URL.String(),
-		Headers:   headers,
-		RequestId: reqID,
-		Timestamp: time.Now().UnixNano(),
+		Method:       r.Method,
+		Url:          r.URL.String(),
+		Headers:      headers,
+		HeaderValues: headerValues,
+		RequestId:    reqID,
+		Timestamp:    time.Now().UnixNano(),
 	}
 
 	chosen.mu.Lock()
@@ -112,16 +112,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, chosen *backendConn
 }
 
 func writeHTTPResponse(w http.ResponseWriter, resp *pb.HTTPResponse) {
-	for k, v := range filterInternalHeaders(resp.Headers) {
-		w.Header().Set(k, v)
-	}
+	copyHTTPHeaders(w.Header(), filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues)))
 	status := int(resp.Status)
 	if status == 0 {
 		status = http.StatusBadGateway
 	}
 	w.WriteHeader(status)
-	if resp.Body != "" {
-		fmt.Fprint(w, resp.Body)
+	if body := pb.BodyBytesFromProto(resp.Body, resp.BodyBytes); len(body) > 0 {
+		_, _ = w.Write(body)
 	}
 }
 

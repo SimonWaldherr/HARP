@@ -4,24 +4,37 @@ package harp;
 option go_package = "github.com/SimonWaldherr/HARP/harp";
 
 // Represents an HTTP request forwarded from the proxy to the backend.
+message HTTPHeader {
+  string name = 1;
+  repeated string values = 2;
+}
+
 message HTTPRequest {
   string method = 1;
   string url = 2;
+  // Deprecated compatibility field. Use headerValues for repeated headers.
   map<string, string> headers = 3;
+  // Deprecated compatibility field. Use bodyBytes for binary-safe bodies.
   string body = 4;
   string requestId = 5;
   int64 timestamp = 6;
+  repeated HTTPHeader headerValues = 7;
+  bytes bodyBytes = 8;
 }
 
 // Represents an HTTP response from the backend to the proxy.
 message HTTPResponse {
   int32 status = 1;
+  // Deprecated compatibility field. Use headerValues for repeated headers.
   map<string, string> headers = 2;
+  // Deprecated compatibility field. Use bodyBytes for binary-safe bodies.
   string body = 3;
   string requestId = 4;
   int64 timestamp = 5;
   bool cacheable = 6;
   int64 latency = 7;
+  repeated HTTPHeader headerValues = 8;
+  bytes bodyBytes = 9;
 }
 
 // Raw bytes exchanged after a WebSocket HTTP upgrade.

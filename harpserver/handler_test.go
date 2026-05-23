@@ -1,6 +1,8 @@
 package harpserver
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"testing"
 
@@ -166,6 +168,37 @@ func TestConvertProtoToHTTPRequest(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestConvertProtoToHTTPRequestPrefersRepeatedHeadersAndBodyBytes(t *testing.T) {
+	protoReq := &pb.HTTPRequest{
+		Method: "POST",
+		Url:    "http://example.com/api",
+		Body:   "legacy",
+		Headers: map[string]string{
+			"Set-Cookie": "legacy=1",
+		},
+		HeaderValues: []*pb.HTTPHeader{{
+			Name:   "Set-Cookie",
+			Values: []string{"a=1", "b=2"},
+		}},
+		BodyBytes: []byte{0, 1, 2},
+	}
+
+	req, err := convertProtoToHTTPRequest(protoReq)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := req.Header.Values("Set-Cookie"); len(got) != 2 || got[0] != "a=1" || got[1] != "b=2" {
+		t.Fatalf("expected repeated Set-Cookie headers, got %#v", got)
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("unexpected body read error: %v", err)
+	}
+	if !bytes.Equal(body, []byte{0, 1, 2}) {
+		t.Fatalf("expected binary body, got %#v", body)
 	}
 }
 

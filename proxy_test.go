@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"expvar"
 	"net/http"
@@ -602,6 +603,188 @@ func TestAdminHandlersRequireConfiguredPassword(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected authenticated admin request to return 200, got %d", rec.Code)
+	}
+}
+
+func TestRegisterHealthHandlers(t *testing.T) {
+	origConfig := config
+	origStart := startTime
+	t.Cleanup(func() {
+		config = origConfig
+		startTime = origStart
+	})
+
+	config.EnableHealthCheck = true
+	config.HealthCheckPath = "/health"
+	startTime = time.Now().Add(-time.Second)
+
+	mux := http.NewServeMux()
+	registerHealthHandlers(mux)
+
+	tests := []struct {
+		path       string
+		wantCode   int
+		wantCheck  string
+		wantStatus string
+	}{
+		{"/health", http.StatusOK, "healthz", "healthy"},
+		{"/healthz", http.StatusOK, "healthz", "healthy"},
+		{"/livez", http.StatusOK, "livez", "alive"},
+		{"/readyz", http.StatusOK, "readyz", "ready"},
+	}
+
+	for _, tc := range tests {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		mux.ServeHTTP(rec, req)
+		if rec.Code != tc.wantCode {
+			t.Fatalf("%s: expected status %d, got %d", tc.path, tc.wantCode, rec.Code)
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%s: invalid json response: %v", tc.path, err)
+		}
+		if body["check"] != tc.wantCheck {
+			t.Fatalf("%s: expected check %q, got %#v", tc.path, tc.wantCheck, body["check"])
+		}
+		if body["status"] != tc.wantStatus {
+			t.Fatalf("%s: expected status %q, got %#v", tc.path, tc.wantStatus, body["status"])
+		}
+	}
+}
+
+func TestReadyzReportsUnavailableBeforeStartup(t *testing.T) {
+	origStart := startTime
+	t.Cleanup(func() { startTime = origStart })
+	startTime = time.Time{}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	readyzHandler(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503, got %d", rec.Code)
+	}
+}
+
+func TestForwardedRequestHeadersStripHopByHopAndAddProxyHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "https://public.example.test/app", nil)
+	req.Host = "public.example.test"
+	req.RemoteAddr = "203.0.113.7:54321"
+	req.TLS = &tls.ConnectionState{}
+	req.Header.Set("Accept", "text/plain")
+	req.Header.Set("Connection", "keep-alive, X-Custom-Hop")
+	req.Header.Set("Keep-Alive", "timeout=5")
+	req.Header.Set("Proxy-Authorization", "secret")
+	req.Header.Set("TE", "trailers")
+	req.Header.Set("Trailer", "Expires")
+	req.Header.Set("Transfer-Encoding", "chunked")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("X-Custom-Hop", "remove-me")
+	req.Header.Set("X-Forwarded-For", "198.51.100.10")
+
+	got := forwardedRequestHeaders(req)
+
+	for _, key := range []string{
+		"Connection",
+		"Keep-Alive",
+		"Proxy-Authorization",
+		"TE",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
+		"X-Custom-Hop",
+	} {
+		if value := got.Get(key); value != "" {
+			t.Fatalf("expected %s to be stripped, got %q", key, value)
+		}
+	}
+	if got.Get("Accept") != "text/plain" {
+		t.Fatalf("expected end-to-end header to be preserved, got %q", got.Get("Accept"))
+	}
+	if values := got.Values("X-Forwarded-For"); len(values) != 2 || values[0] != "198.51.100.10" || values[1] != "203.0.113.7" {
+		t.Fatalf("unexpected X-Forwarded-For chain: %#v", values)
+	}
+	if got.Get("X-Forwarded-Host") != "public.example.test" {
+		t.Fatalf("unexpected X-Forwarded-Host: %q", got.Get("X-Forwarded-Host"))
+	}
+	if got.Get("X-Forwarded-Proto") != "https" {
+		t.Fatalf("unexpected X-Forwarded-Proto: %q", got.Get("X-Forwarded-Proto"))
+	}
+	if got.Get("Forwarded") != `for="203.0.113.7";proto="https";host="public.example.test"` {
+		t.Fatalf("unexpected Forwarded header: %q", got.Get("Forwarded"))
+	}
+}
+
+func TestForwardedRequestHeadersPreserveExistingForwardedDefaults(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://internal.example.test/app", nil)
+	req.Host = "public.example.test"
+	req.RemoteAddr = "203.0.113.9:1234"
+	req.Header.Set("X-Forwarded-Host", "edge.example.test")
+	req.Header.Set("X-Forwarded-Proto", "https")
+
+	got := forwardedRequestHeaders(req)
+
+	if got.Get("X-Forwarded-Host") != "edge.example.test" {
+		t.Fatalf("expected existing X-Forwarded-Host to be preserved, got %q", got.Get("X-Forwarded-Host"))
+	}
+	if got.Get("X-Forwarded-Proto") != "https" {
+		t.Fatalf("expected existing X-Forwarded-Proto to be preserved, got %q", got.Get("X-Forwarded-Proto"))
+	}
+	if got.Get("Forwarded") != `for="203.0.113.9";proto="http";host="public.example.test"` {
+		t.Fatalf("unexpected Forwarded header: %q", got.Get("Forwarded"))
+	}
+}
+
+func TestWebSocketForwardedRequestHeadersPreserveUpgradeHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://public.example.test/ws", nil)
+	req.Host = "public.example.test"
+	req.RemoteAddr = "203.0.113.11:1234"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-Websocket-Key", "test-key")
+	req.Header.Set("Sec-Websocket-Version", "13")
+	req.Header.Set("X-Custom-Hop", "remove-me")
+	req.Header.Add("Connection", "X-Custom-Hop")
+
+	got := websocketForwardedRequestHeaders(req)
+
+	if got.Get("Connection") != "Upgrade" {
+		t.Fatalf("expected WebSocket Connection header to be preserved, got %q", got.Get("Connection"))
+	}
+	if got.Get("Upgrade") != "websocket" {
+		t.Fatalf("expected WebSocket Upgrade header to be preserved, got %q", got.Get("Upgrade"))
+	}
+	if got.Get("X-Custom-Hop") != "" {
+		t.Fatalf("expected custom Connection token header to be stripped, got %q", got.Get("X-Custom-Hop"))
+	}
+	if got.Get("Sec-Websocket-Key") != "test-key" {
+		t.Fatalf("expected WebSocket key header to be preserved, got %q", got.Get("Sec-Websocket-Key"))
+	}
+	if got.Get("X-Forwarded-For") != "203.0.113.11" {
+		t.Fatalf("unexpected X-Forwarded-For: %q", got.Get("X-Forwarded-For"))
+	}
+	if got.Get("Forwarded") != `for="203.0.113.11";proto="http";host="public.example.test"` {
+		t.Fatalf("unexpected Forwarded header: %q", got.Get("Forwarded"))
+	}
+}
+
+func TestFilterInternalHTTPHeadersStripsHopByHopResponseHeaders(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Content-Type", "text/plain")
+	headers.Set("Connection", "X-Backend-Hop")
+	headers.Set("X-Backend-Hop", "remove-me")
+	headers.Set("Upgrade", "websocket")
+	headers.Set(pb.StreamHeader, "true")
+
+	got := filterInternalHTTPHeaders(headers)
+
+	if got.Get("Content-Type") != "text/plain" {
+		t.Fatalf("expected response content type to be preserved, got %q", got.Get("Content-Type"))
+	}
+	for _, key := range []string{"Connection", "X-Backend-Hop", "Upgrade", pb.StreamHeader} {
+		if value := got.Get(key); value != "" {
+			t.Fatalf("expected %s to be stripped, got %q", key, value)
+		}
 	}
 }
 

@@ -213,13 +213,15 @@ func (s *BackendServer) handleRequest(
 
 	// Build HTTPResponse proto.
 	respProto := &pb.HTTPResponse{
-		Status:    int32(recorder.code),
-		Headers:   headerToMap(recorder.HeaderMap),
-		Body:      recorder.Body.String(),
-		RequestId: reqProto.RequestId,
-		Timestamp: time.Now().UnixNano(),
-		Cacheable: false,
-		Latency:   time.Since(time.Unix(0, reqProto.Timestamp)).Nanoseconds(),
+		Status:       int32(recorder.code),
+		Headers:      headerToMap(recorder.HeaderMap),
+		HeaderValues: pb.HeaderValuesFromHTTP(recorder.HeaderMap),
+		Body:         pb.BodyStringForLegacy(recorder.Body.Bytes()),
+		BodyBytes:    append([]byte(nil), recorder.Body.Bytes()...),
+		RequestId:    reqProto.RequestId,
+		Timestamp:    time.Now().UnixNano(),
+		Cacheable:    false,
+		Latency:      time.Since(time.Unix(0, reqProto.Timestamp)).Nanoseconds(),
 	}
 
 	sendMu.Lock()
@@ -249,13 +251,15 @@ func (s *BackendServer) handleStreamingRequest(
 			headers[pb.StreamEndHeader] = "1"
 		}
 		respProto := &pb.HTTPResponse{
-			Status:    int32(statusCode),
-			Headers:   headers,
-			Body:      body,
-			RequestId: reqProto.RequestId,
-			Timestamp: time.Now().UnixNano(),
-			Cacheable: false,
-			Latency:   time.Since(requestStart).Nanoseconds(),
+			Status:       int32(statusCode),
+			Headers:      headers,
+			HeaderValues: pb.HeaderValuesFromHTTP(pb.HTTPHeaderFromProto(headers, nil)),
+			Body:         body,
+			BodyBytes:    []byte(body),
+			RequestId:    reqProto.RequestId,
+			Timestamp:    time.Now().UnixNano(),
+			Cacheable:    false,
+			Latency:      time.Since(requestStart).Nanoseconds(),
 		}
 		sendMu.Lock()
 		defer sendMu.Unlock()
@@ -276,7 +280,7 @@ func (s *BackendServer) handleStreamingRequest(
 
 // convertProtoToHTTPRequest converts a pb.HTTPRequest to an *http.Request.
 func convertProtoToHTTPRequest(protoReq *pb.HTTPRequest) (*http.Request, error) {
-	body := bytes.NewBufferString(protoReq.Body)
+	body := bytes.NewReader(pb.BodyBytesFromProto(protoReq.Body, protoReq.BodyBytes))
 	parsedURL, err := url.Parse(protoReq.Url)
 	if err != nil {
 		return nil, err
@@ -285,10 +289,7 @@ func convertProtoToHTTPRequest(protoReq *pb.HTTPRequest) (*http.Request, error) 
 	if err != nil {
 		return nil, err
 	}
-	// Populate headers.
-	for k, v := range protoReq.Headers {
-		req.Header.Set(k, v)
-	}
+	req.Header = pb.HTTPHeaderFromProto(protoReq.Headers, protoReq.HeaderValues)
 	// You can set other fields as needed.
 	req.URL = parsedURL
 	return req, nil
@@ -321,13 +322,6 @@ func (rr *ResponseRecorder) WriteHeader(statusCode int) {
 	rr.code = statusCode
 }
 
-// headerToMap converts http.Header to a simple map[string]string.
 func headerToMap(h http.Header) map[string]string {
-	m := make(map[string]string)
-	for k, v := range h {
-		if len(v) > 0 {
-			m[k] = v[0]
-		}
-	}
-	return m
+	return pb.HeaderMapFromHTTP(h)
 }

@@ -463,21 +463,64 @@ const (
 	responseChannelBufferSize = 8
 )
 
-// Health check endpoint
-func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+func healthSnapshot(status, check string) map[string]interface{} {
 	backendsMu.RLock()
 	backendCount := len(backends)
 	backendsMu.RUnlock()
 
-	health := map[string]interface{}{
-		"status":    "healthy",
-		"timestamp": time.Now().Unix(),
-		"backends":  backendCount,
-		"uptime":    time.Since(startTime).Seconds(),
+	uptime := 0.0
+	if !startTime.IsZero() {
+		uptime = time.Since(startTime).Seconds()
 	}
 
+	return map[string]interface{}{
+		"status":    status,
+		"check":     check,
+		"timestamp": time.Now().Unix(),
+		"backends":  backendCount,
+		"uptime":    uptime,
+	}
+}
+
+func writeHealthJSON(w http.ResponseWriter, statusCode int, payload map[string]interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(health)
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		logError("Error writing health response: %v", err)
+	}
+}
+
+// Health check endpoint kept for backwards compatibility.
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	writeHealthJSON(w, http.StatusOK, healthSnapshot("healthy", "healthz"))
+}
+
+func livezHandler(w http.ResponseWriter, r *http.Request) {
+	writeHealthJSON(w, http.StatusOK, healthSnapshot("alive", "livez"))
+}
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if startTime.IsZero() {
+		writeHealthJSON(w, http.StatusServiceUnavailable, healthSnapshot("not_ready", "readyz"))
+		return
+	}
+	writeHealthJSON(w, http.StatusOK, healthSnapshot("ready", "readyz"))
+}
+
+func registerHealthHandlers(mux *http.ServeMux) {
+	if !config.EnableHealthCheck {
+		return
+	}
+	healthPath := config.HealthCheckPath
+	if healthPath == "" {
+		healthPath = "/health"
+	}
+	mux.HandleFunc(healthPath, healthCheckHandler)
+	if healthPath != "/healthz" {
+		mux.HandleFunc("/healthz", healthCheckHandler)
+	}
+	mux.HandleFunc("/livez", livezHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
 }
 
 func registeredRoutesSnapshot() []routeSnapshot {
@@ -805,7 +848,7 @@ func isRegistrationAllowed(path, key string) bool {
 }
 
 func deliverPendingResponse(ctx context.Context, resp *pb.HTTPResponse, ch chan<- *pb.HTTPResponse) bool {
-	if headerEnabled(resp.Headers, pb.StreamHeader) {
+	if responseHeaderEnabled(resp, pb.StreamHeader) {
 		select {
 		case ch <- resp:
 			return true
@@ -921,18 +964,20 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 
 	reqID := uuid.New().String()
 	w.Header().Set("X-Request-ID", reqID)
-	headers := make(map[string]string)
-	for k, v := range r.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
-		}
+	isWS := isWebSocketUpgrade(r)
+	forwardHeaders := forwardedRequestHeaders(r)
+	if isWS {
+		forwardHeaders = websocketForwardedRequestHeaders(r)
 	}
+	headers := pb.HeaderMapFromHTTP(forwardHeaders)
+	headerValues := pb.HeaderValuesFromHTTP(forwardHeaders)
 	if authenticatedRoute {
 		delete(headers, "Authorization")
+		headerValues = removeHeaderValues(headerValues, "Authorization")
 	}
 
-	if isWebSocketUpgrade(r) {
-		handleWebSocket(w, r, chosen, headers)
+	if isWS {
+		handleWebSocket(w, r, chosen, headers, headerValues)
 		return
 	}
 
@@ -941,11 +986,11 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		if resp, ok := cacheStore.Get(cacheKey); ok {
 			logDebug("Cache hit for %s", r.URL.String())
 			metrics.CacheHits.Add(1)
-			for k, v := range resp.Headers {
-				w.Header().Set(k, v)
-			}
+			copyHTTPHeaders(w.Header(), filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues)))
 			w.WriteHeader(int(resp.Status))
-			fmt.Fprint(w, resp.Body)
+			if body := pb.BodyBytesFromProto(resp.Body, resp.BodyBytes); len(body) > 0 {
+				_, _ = w.Write(body)
+			}
 			return
 		}
 		metrics.CacheMisses.Add(1)
@@ -953,12 +998,14 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Build an HTTPRequest message.
 	httpReq := &pb.HTTPRequest{
-		Method:    r.Method,
-		Url:       r.URL.String(),
-		Headers:   headers,
-		Body:      bodyStr,
-		RequestId: reqID,
-		Timestamp: time.Now().UnixNano(),
+		Method:       r.Method,
+		Url:          r.URL.String(),
+		Headers:      headers,
+		HeaderValues: headerValues,
+		Body:         bodyStr,
+		BodyBytes:    append([]byte(nil), bodyBytes...),
+		RequestId:    reqID,
+		Timestamp:    time.Now().UnixNano(),
 	}
 
 	// Prepare channel for response.
@@ -998,39 +1045,43 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case resp := <-respCh:
-		isStream := headerEnabled(resp.Headers, pb.StreamHeader)
+		isStream := responseHeaderEnabled(resp, pb.StreamHeader)
 		firstStatus := int(resp.Status)
-		firstHeaders := filterInternalHeaders(resp.Headers)
+		firstHTTPHeaders := filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues))
 		if isStream {
-			applyStreamDefaults(firstHeaders, streamType(resp.Headers))
+			applyStreamDefaultsHTTP(firstHTTPHeaders, streamTypeFromResponse(resp))
 		}
+		firstHeaders := pb.HeaderMapFromHTTP(firstHTTPHeaders)
 		var bodyBuilder strings.Builder
+		var bodyBytesBuilder []byte
 		wroteHeaders := false
 		for {
 			if !wroteHeaders {
-				for k, v := range firstHeaders {
-					w.Header().Set(k, v)
-				}
+				copyHTTPHeaders(w.Header(), firstHTTPHeaders)
 				w.WriteHeader(firstStatus)
 				wroteHeaders = true
 			}
 
-			if resp.Body != "" {
-				fmt.Fprint(w, resp.Body)
+			respBody := pb.BodyBytesFromProto(resp.Body, resp.BodyBytes)
+			if len(respBody) > 0 {
+				_, _ = w.Write(respBody)
 				if !isStream {
-					bodyBuilder.WriteString(resp.Body)
+					bodyBuilder.WriteString(string(respBody))
+					bodyBytesBuilder = append(bodyBytesBuilder, respBody...)
 				}
 				if isStream && canFlush {
 					flusher.Flush()
 				}
 			}
 
-			if !isStream || headerEnabled(resp.Headers, pb.StreamEndHeader) {
+			if !isStream || responseHeaderEnabled(resp, pb.StreamEndHeader) {
 				if config.EnableCache && strings.ToUpper(r.Method) == "GET" && config.CacheType != "none" && !isStream {
 					cacheStore.Set(cacheKey, &pb.HTTPResponse{
-						Status:  int32(firstStatus),
-						Headers: firstHeaders,
-						Body:    bodyBuilder.String(),
+						Status:       int32(firstStatus),
+						Headers:      firstHeaders,
+						HeaderValues: pb.HeaderValuesFromHTTP(firstHTTPHeaders),
+						Body:         bodyBuilder.String(),
+						BodyBytes:    bodyBytesBuilder,
 					})
 				}
 				return
@@ -1131,8 +1182,35 @@ func headerValue(headers map[string]string, key string) string {
 	return ""
 }
 
+func responseHeaderEnabled(resp *pb.HTTPResponse, key string) bool {
+	val := strings.TrimSpace(strings.ToLower(protoHeaderValue(resp.Headers, resp.HeaderValues, key)))
+	return val == "1" || val == "true" || val == "yes"
+}
+
+func protoHeaderValue(headers map[string]string, values []*pb.HTTPHeader, key string) string {
+	for _, header := range values {
+		if header != nil && strings.EqualFold(header.Name, key) && len(header.Values) > 0 {
+			return header.Values[0]
+		}
+	}
+	return headerValue(headers, key)
+}
+
 func streamType(headers map[string]string) string {
 	switch strings.ToLower(strings.TrimSpace(headerValue(headers, pb.StreamTypeHeader))) {
+	case pb.StreamTypeSSE:
+		return pb.StreamTypeSSE
+	case pb.StreamTypeNDJSON:
+		return pb.StreamTypeNDJSON
+	case pb.StreamTypeText:
+		return pb.StreamTypeText
+	default:
+		return pb.StreamTypeChunked
+	}
+}
+
+func streamTypeFromResponse(resp *pb.HTTPResponse) string {
+	switch strings.ToLower(strings.TrimSpace(protoHeaderValue(resp.Headers, resp.HeaderValues, pb.StreamTypeHeader))) {
 	case pb.StreamTypeSSE:
 		return pb.StreamTypeSSE
 	case pb.StreamTypeNDJSON:
@@ -1158,13 +1236,41 @@ func applyStreamDefaults(headers map[string]string, typ string) {
 	}
 }
 
+func applyStreamDefaultsHTTP(headers http.Header, typ string) {
+	deleteHTTPHeader(headers, "Content-Length")
+	switch typ {
+	case pb.StreamTypeSSE:
+		setHTTPHeaderDefault(headers, "Content-Type", "text/event-stream")
+		setHTTPHeaderDefault(headers, "Cache-Control", "no-cache")
+		setHTTPHeaderDefault(headers, "X-Accel-Buffering", "no")
+	case pb.StreamTypeNDJSON:
+		setHTTPHeaderDefault(headers, "Content-Type", "application/x-ndjson")
+	case pb.StreamTypeText:
+		setHTTPHeaderDefault(headers, "Content-Type", "text/plain; charset=utf-8")
+	}
+}
+
 func setHeaderDefault(headers map[string]string, key, value string) {
 	if headerValue(headers, key) == "" {
 		headers[key] = value
 	}
 }
 
+func setHTTPHeaderDefault(headers http.Header, key, value string) {
+	if headers.Get(key) == "" {
+		headers.Set(key, value)
+	}
+}
+
 func deleteHeader(headers map[string]string, key string) {
+	for k := range headers {
+		if strings.EqualFold(k, key) {
+			delete(headers, k)
+		}
+	}
+}
+
+func deleteHTTPHeader(headers http.Header, key string) {
 	for k := range headers {
 		if strings.EqualFold(k, key) {
 			delete(headers, k)
@@ -1183,6 +1289,150 @@ func filterInternalHeaders(headers map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+func filterInternalHTTPHeaders(headers http.Header) http.Header {
+	out := make(http.Header, len(headers))
+	connectionTokens := hopByHopConnectionTokens(headers)
+	for k, values := range headers {
+		if strings.EqualFold(k, pb.StreamHeader) ||
+			strings.EqualFold(k, pb.StreamEndHeader) ||
+			strings.EqualFold(k, pb.StreamTypeHeader) ||
+			isHopByHopHeader(k) ||
+			connectionTokens[strings.ToLower(k)] {
+			continue
+		}
+		out[k] = append([]string(nil), values...)
+	}
+	return out
+}
+
+func copyHTTPHeaders(dst, src http.Header) {
+	for k, values := range src {
+		dst.Del(k)
+		for _, value := range values {
+			dst.Add(k, value)
+		}
+	}
+}
+
+func removeHeaderValues(values []*pb.HTTPHeader, key string) []*pb.HTTPHeader {
+	out := values[:0]
+	for _, header := range values {
+		if header == nil || strings.EqualFold(header.Name, key) {
+			continue
+		}
+		out = append(out, header)
+	}
+	return out
+}
+
+func forwardedRequestHeaders(r *http.Request) http.Header {
+	headers := removeHopByHopHeaders(r.Header)
+	addForwardedHeaders(headers, r)
+	return headers
+}
+
+func websocketForwardedRequestHeaders(r *http.Request) http.Header {
+	headers := removeHopByHopHeaders(r.Header)
+	copyHeaderIfPresent(headers, r.Header, "Connection")
+	copyHeaderIfPresent(headers, r.Header, "Upgrade")
+	addForwardedHeaders(headers, r)
+	return headers
+}
+
+func addForwardedHeaders(headers http.Header, r *http.Request) {
+	clientIP := clientIPFromRemoteAddr(r.RemoteAddr)
+	if clientIP != "" {
+		appendHeaderValue(headers, "X-Forwarded-For", clientIP)
+	}
+	if r.Host != "" {
+		setHTTPHeaderDefault(headers, "X-Forwarded-Host", r.Host)
+	}
+	proto := "http"
+	if r.TLS != nil {
+		proto = "https"
+	}
+	setHTTPHeaderDefault(headers, "X-Forwarded-Proto", proto)
+	appendForwardedHeader(headers, clientIP, proto, r.Host)
+}
+
+func copyHeaderIfPresent(dst, src http.Header, key string) {
+	values := src.Values(key)
+	if len(values) == 0 {
+		return
+	}
+	dst[key] = append([]string(nil), values...)
+}
+
+func removeHopByHopHeaders(headers http.Header) http.Header {
+	out := make(http.Header, len(headers))
+	connectionTokens := hopByHopConnectionTokens(headers)
+	for k, values := range headers {
+		if isHopByHopHeader(k) || connectionTokens[strings.ToLower(k)] {
+			continue
+		}
+		out[k] = append([]string(nil), values...)
+	}
+	return out
+}
+
+func hopByHopConnectionTokens(headers http.Header) map[string]bool {
+	tokens := make(map[string]bool)
+	for _, value := range headers.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			token = strings.ToLower(strings.TrimSpace(token))
+			if token != "" {
+				tokens[token] = true
+			}
+		}
+	}
+	return tokens
+}
+
+func isHopByHopHeader(name string) bool {
+	switch strings.ToLower(name) {
+	case "connection",
+		"keep-alive",
+		"proxy-authenticate",
+		"proxy-authorization",
+		"te",
+		"trailer",
+		"transfer-encoding",
+		"upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func appendHeaderValue(headers http.Header, key, value string) {
+	if value == "" {
+		return
+	}
+	headers.Add(key, value)
+}
+
+func appendForwardedHeader(headers http.Header, clientIP, proto, host string) {
+	parts := make([]string, 0, 3)
+	if clientIP != "" {
+		parts = append(parts, "for="+quoteForwardedValue(clientIP))
+	}
+	if proto != "" {
+		parts = append(parts, "proto="+quoteForwardedValue(proto))
+	}
+	if host != "" {
+		parts = append(parts, "host="+quoteForwardedValue(host))
+	}
+	if len(parts) > 0 {
+		headers.Add("Forwarded", strings.Join(parts, ";"))
+	}
+}
+
+func quoteForwardedValue(value string) string {
+	escaped := strings.ReplaceAll(value, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return `"` + escaped + `"`
 }
 
 // --- Server Starters ---
@@ -1224,15 +1474,7 @@ func startHTTPServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", httpHandler)
 	registerAdminHandlers(mux)
-
-	// Add health check endpoint
-	if config.EnableHealthCheck {
-		healthPath := config.HealthCheckPath
-		if healthPath == "" {
-			healthPath = "/health"
-		}
-		mux.HandleFunc(healthPath, healthCheckHandler)
-	}
+	registerHealthHandlers(mux)
 
 	// Parse timeouts
 	readTimeout := 30 * time.Second
@@ -1279,14 +1521,7 @@ func startHTTPSServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", httpHandler)
 	registerAdminHandlers(mux)
-
-	if config.EnableHealthCheck {
-		healthPath := config.HealthCheckPath
-		if healthPath == "" {
-			healthPath = "/health"
-		}
-		mux.HandleFunc(healthPath, healthCheckHandler)
-	}
+	registerHealthHandlers(mux)
 
 	server := &http.Server{
 		Addr:         config.HTTPPort,
@@ -1310,14 +1545,7 @@ func startHTTP3Server() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", httpHandler)
 	registerAdminHandlers(mux)
-
-	if config.EnableHealthCheck {
-		healthPath := config.HealthCheckPath
-		if healthPath == "" {
-			healthPath = "/health"
-		}
-		mux.HandleFunc(healthPath, healthCheckHandler)
-	}
+	registerHealthHandlers(mux)
 
 	server := &http3.Server{
 		Addr:      config.HTTP3Port,

@@ -90,10 +90,13 @@ func (w *websocketResponseWriter) Hijacked() bool {
 }
 
 func (w *websocketResponseWriter) Response() *pb.HTTPResponse {
+	body := w.body.Bytes()
 	return &pb.HTTPResponse{
-		Status:  int32(w.code),
-		Headers: headerToMap(w.header),
-		Body:    w.body.String(),
+		Status:       int32(w.code),
+		Headers:      headerToMap(w.header),
+		HeaderValues: pb.HeaderValuesFromHTTP(w.header),
+		Body:         pb.BodyStringForLegacy(body),
+		BodyBytes:    append([]byte(nil), body...),
 	}
 }
 

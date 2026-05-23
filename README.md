@@ -184,7 +184,7 @@ The `config.json` file controls the proxy behavior:
 | `adminPath` | string | `/admin` | Admin dashboard path when enabled |
 | `adminUsername` | string | `admin` | Admin dashboard Basic Auth username |
 | `adminPassword` | string | empty | Admin dashboard Basic Auth password; empty disables admin auth |
-| `enableHealthCheck` | bool | `true` | Enable `/health` endpoint |
+| `enableHealthCheck` | bool | `true` | Enable `/health`, `/healthz`, `/livez`, and `/readyz` endpoints |
 | `enableMetrics` | bool | `true` | Enable `/metrics` + pprof |
 | `metricsPort` | string | `:9091` | Metrics server listen address |
 | `requestTimeout` | string | `30s` | Backend response timeout |
@@ -401,7 +401,7 @@ make build-gateway
 | `streaming` | bool | `false` | Enable chunked streaming relay for long-lived responses (SSE/token streams) |
 | `streamingType` | string | `chunked` | Stream response defaults: `chunked`, `sse`, `ndjson`, or `text`; setting it also enables streaming |
 | `addHeaders` | object | `{}` | Extra headers injected into every upstream request (auth tokens, API keys, …) |
-| `timeoutSeconds` | int | `30` | Per-request timeout for the upstream call |
+| `timeoutSeconds` | int | `30` | Per-request timeout; streaming routes use no timeout when set to `0` |
 
 ### How It Works
 
@@ -411,6 +411,14 @@ make build-gateway
 4. The upstream response is relayed back through gRPC to the proxy and then to the client.
 
 Auto-reconnect is built in — if the connection to the proxy drops, the gateway retries every `reconnectInterval`.
+
+HARP behaves like a standard reverse proxy for forwarded request metadata:
+hop-by-hop headers such as `Connection`, `Keep-Alive`, `TE`, `Trailer`,
+`Transfer-Encoding`, `Upgrade`, and custom headers named by `Connection` are
+stripped before normal HTTP requests are sent to a backend. `Forwarded`,
+`X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto` are populated so
+backends can reconstruct the public request context. WebSocket upgrades keep
+`Connection` and `Upgrade` only on the dedicated WebSocket tunnel path.
 
 See [cmd/harp-gateway/gateway-example.json](cmd/harp-gateway/gateway-example.json) for the full example config.
 For a ready-to-use home-LLM setup, see [demos/llm-gateway](demos/llm-gateway/).
@@ -424,7 +432,10 @@ When `enableMetrics` is `true`, a separate HTTP server starts on `metricsPort` e
 | Endpoint | Description |
 |----------|-------------|
 | `/metrics` | JSON metrics: request totals, cache hits/misses, backend errors, per-route counts, rate-limited requests, memory stats |
-| `/health` | Health check with uptime and connected backend count |
+| `/health` | Backwards-compatible health check with uptime and connected backend count |
+| `/healthz` | Kubernetes-style general health check |
+| `/livez` | Liveness check: process is alive |
+| `/readyz` | Readiness check: proxy has completed startup |
 | `/debug/pprof/` | Go pprof profiling endpoints |
 | `/debug/vars` | expvar variables |
 
