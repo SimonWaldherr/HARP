@@ -5,13 +5,13 @@ go 1.23
 toolchain go1.24.5
 
 require (
-	github.com/SimonWaldherr/HARP/harpserver v1.6.0
+	github.com/SimonWaldherr/HARP/harpserver v1.1.8-0.20260523160642-59b86864ee1e
 	github.com/gorilla/mux v1.8.1
 	github.com/gorilla/websocket v1.5.3
 )
 
 require (
-	github.com/SimonWaldherr/HARP/harp v1.6.0 // indirect
+	github.com/SimonWaldherr/HARP/harp v1.1.8-0.20260523160642-59b86864ee1e // indirect
 	golang.org/x/net v0.32.0 // indirect
 	golang.org/x/sys v0.28.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
