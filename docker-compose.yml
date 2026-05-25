@@ -1,0 +1,32 @@
+services:
+  harp-proxy:
+    build:
+      context: .
+    image: harp:local
+    ports:
+      - "8080:8080"
+      - "50054:50054"
+      - "9091:9091"
+    volumes:
+      - ./deploy/configs/proxy.docker.json:/etc/harp/config.json:ro
+    healthcheck:
+      test: ["CMD", "harpctl", "ready", "-addr", "http://127.0.0.1:8080"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  headers-demo:
+    image: harp:local
+    entrypoint: ["/usr/local/bin/harp-demo-headers"]
+    command: ["-proxy", "harp-proxy:50054"]
+    depends_on:
+      harp-proxy:
+        condition: service_healthy
+
+  webhook-catcher:
+    image: harp:local
+    entrypoint: ["/usr/local/bin/harp-demo-webhook-catcher"]
+    command: ["-proxy", "harp-proxy:50054"]
+    depends_on:
+      harp-proxy:
+        condition: service_healthy

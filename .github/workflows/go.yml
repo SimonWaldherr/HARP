@@ -1,4 +1,4 @@
-name: Build
+name: CI
 
 on:
   push:
@@ -7,31 +7,39 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
-
-      - name: Cache Go Modules
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            harp/go.sum
+            harpserver/go.sum
+            demos/remote-helper-go/go.sum
+            demos/advanced-enterprise/go.sum
 
       - name: Verify Dependencies
-        run: go mod tidy
+        run: go mod tidy && git diff --exit-code go.mod go.sum
 
-      - name: Build Proxy
-        run: go build -v -ldflags "-w" -o harpProxy .
+      - name: Format Check
+        run: test -z "$(gofmt -l .)"
 
-      - name: Build Demo Client
-        run: go build -v -ldflags "-w" -o harpDemoClient ./demos/simple-go
+      - name: Vet
+        run: make vet-all
+
+      - name: Test
+        run: make test-all
+
+      - name: Build
+        run: make build
+
+      - name: Docker Compose Config
+        run: docker compose config >/dev/null
+
+      - name: Docker Build
+        run: docker build -t harp:ci .

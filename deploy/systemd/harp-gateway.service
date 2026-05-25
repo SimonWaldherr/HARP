@@ -1,0 +1,21 @@
+[Unit]
+Description=HARP gateway agent
+Documentation=https://github.com/SimonWaldherr/HARP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=harp
+Group=harp
+ExecStart=/usr/local/bin/harp-gateway -config /etc/harp/gateway.json
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

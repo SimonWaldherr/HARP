@@ -202,6 +202,41 @@ func TestConvertProtoToHTTPRequestPrefersRepeatedHeadersAndBodyBytes(t *testing.
 	}
 }
 
+func TestConvertProtoToHTTPRequestUsesForwardedHost(t *testing.T) {
+	protoReq := &pb.HTTPRequest{
+		Method: "GET",
+		Url:    "/api",
+		Headers: map[string]string{
+			"Host":             "internal.example.test",
+			"X-Forwarded-Host": "public.example.test, edge.example.test",
+		},
+	}
+
+	req, err := convertProtoToHTTPRequest(protoReq)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Host != "public.example.test" {
+		t.Fatalf("expected forwarded host, got %q", req.Host)
+	}
+}
+
+func TestConvertProtoToHTTPRequestFallsBackToHostHeader(t *testing.T) {
+	protoReq := &pb.HTTPRequest{
+		Method:  "GET",
+		Url:     "/api",
+		Headers: map[string]string{"Host": "internal.example.test"},
+	}
+
+	req, err := convertProtoToHTTPRequest(protoReq)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Host != "internal.example.test" {
+		t.Fatalf("expected host header fallback, got %q", req.Host)
+	}
+}
+
 func TestConvertProtoToHTTPRequestInvalidURL(t *testing.T) {
 	protoReq := &pb.HTTPRequest{
 		Method: "GET",

@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,46 +43,49 @@ import (
 
 // Config holds proxy configuration parameters.
 type Config struct {
-	GRPCPort            string                    `json:"grpcPort"`
-	HTTPPort            string                    `json:"httpPort"`
-	HTTP3Port           string                    `json:"http3Port"`
-	EnableGRPCTLS       bool                      `json:"enableGRPCTLS"`
-	GRPCTLSCert         string                    `json:"grpcTLSCert"`
-	GRPCTLSKey          string                    `json:"grpcTLSKey"`
-	EnableHTTPS         bool                      `json:"enableHTTPS"`
-	HTTPSCert           string                    `json:"httpsCert"`
-	HTTPSKey            string                    `json:"httpsKey"`
-	EnableHTTP3         bool                      `json:"enableHTTP3"`
-	EnableCache         bool                      `json:"enableCache"`
-	CacheType           string                    `json:"cacheType"`
-	DiskCacheDir        string                    `json:"diskCacheDir"`
-	CacheTTL            string                    `json:"cacheTTL"`
-	AllowedRegistration []AllowedRegistrationRule `json:"allowedRegistration"`
-	LogLevel            string                    `json:"logLevel"`
+	GRPCPort              string                    `json:"grpcPort"`
+	HTTPPort              string                    `json:"httpPort"`
+	HTTP3Port             string                    `json:"http3Port"`
+	EnableGRPCTLS         bool                      `json:"enableGRPCTLS"`
+	GRPCTLSCert           string                    `json:"grpcTLSCert"`
+	GRPCTLSKey            string                    `json:"grpcTLSKey"`
+	EnableHTTPS           bool                      `json:"enableHTTPS"`
+	HTTPSCert             string                    `json:"httpsCert"`
+	HTTPSKey              string                    `json:"httpsKey"`
+	EnableHTTP3           bool                      `json:"enableHTTP3"`
+	EnableCache           bool                      `json:"enableCache"`
+	CacheType             string                    `json:"cacheType"`
+	DiskCacheDir          string                    `json:"diskCacheDir"`
+	CacheTTL              string                    `json:"cacheTTL"`
+	AllowedRegistration   []AllowedRegistrationRule `json:"allowedRegistration"`
+	LogLevel              string                    `json:"logLevel"`
+	LoadBalancingStrategy string                    `json:"loadBalancingStrategy"`
 
 	// New optimization settings
-	MaxConcurrentRequests int    `json:"maxConcurrentRequests"`
-	RequestTimeout        string `json:"requestTimeout"`
-	EnableMetrics         bool   `json:"enableMetrics"`
-	MetricsPort           string `json:"metricsPort"`
-	EnableHealthCheck     bool   `json:"enableHealthCheck"`
-	HealthCheckPath       string `json:"healthCheckPath"`
-	ConnectionPoolSize    int    `json:"connectionPoolSize"`
-	EnableRateLimit       bool   `json:"enableRateLimit"`
-	RateLimitPerSecond    int    `json:"rateLimitPerSecond"`
-	EnableCompression     bool   `json:"enableCompression"`
-	MaxHeaderSize         int    `json:"maxHeaderSize"`
-	ReadTimeout           string `json:"readTimeout"`
-	WriteTimeout          string `json:"writeTimeout"`
-	IdleTimeout           string `json:"idleTimeout"`
-	MaxRequestBodySize    int64  `json:"maxRequestBodySize"`
-	EnableCORS            bool   `json:"enableCORS"`
-	CORSAllowedOrigins    string `json:"corsAllowedOrigins"`
-	GracefulShutdownDelay string `json:"gracefulShutdownDelay"`
-	EnableAdminUI         bool   `json:"enableAdminUI"`
-	AdminPath             string `json:"adminPath"`
-	AdminUsername         string `json:"adminUsername"`
-	AdminPassword         string `json:"adminPassword"`
+	MaxConcurrentRequests int      `json:"maxConcurrentRequests"`
+	RequestTimeout        string   `json:"requestTimeout"`
+	EnableMetrics         bool     `json:"enableMetrics"`
+	MetricsPort           string   `json:"metricsPort"`
+	EnableHealthCheck     bool     `json:"enableHealthCheck"`
+	HealthCheckPath       string   `json:"healthCheckPath"`
+	ConnectionPoolSize    int      `json:"connectionPoolSize"`
+	EnableRateLimit       bool     `json:"enableRateLimit"`
+	RateLimitPerSecond    int      `json:"rateLimitPerSecond"`
+	EnableCompression     bool     `json:"enableCompression"`
+	MaxHeaderSize         int      `json:"maxHeaderSize"`
+	ReadTimeout           string   `json:"readTimeout"`
+	WriteTimeout          string   `json:"writeTimeout"`
+	IdleTimeout           string   `json:"idleTimeout"`
+	MaxRequestBodySize    int64    `json:"maxRequestBodySize"`
+	EnableCORS            bool     `json:"enableCORS"`
+	CORSAllowedOrigins    string   `json:"corsAllowedOrigins"`
+	GracefulShutdownDelay string   `json:"gracefulShutdownDelay"`
+	EnableAdminUI         bool     `json:"enableAdminUI"`
+	AdminPath             string   `json:"adminPath"`
+	AdminUsername         string   `json:"adminUsername"`
+	AdminPassword         string   `json:"adminPassword"`
+	AdminInsecureSkipAuth bool     `json:"adminInsecureSkipAuth"`
+	AdminAllowedCIDRs     []string `json:"adminAllowedCIDRs"`
 }
 
 type AllowedRegistrationRule struct {
@@ -115,6 +120,12 @@ var (
 	config                   Config
 	metrics                  *Metrics
 	allowedRegistrationRules []compiledAllowedRegistrationRule
+	adminAllowedPrefixes     []netip.Prefix
+)
+
+const (
+	loadBalancingRoundRobin = "round_robin"
+	loadBalancingFirst      = "first"
 )
 
 var schedulerMetricNames = []string{
@@ -428,6 +439,12 @@ type backendConn struct {
 	mu     sync.Mutex // protects stream writes
 }
 
+type backendPool struct {
+	route registeredRoute
+	conns []*backendConn
+	next  uint64
+}
+
 type registeredRoute struct {
 	name     string
 	pattern  *regexp.Regexp
@@ -442,12 +459,13 @@ type routeSnapshot struct {
 	Domain    string `json:"domain"`
 	Path      string `json:"path"`
 	Protected bool   `json:"protected"`
+	Backends  int    `json:"backends"`
 }
 
 var (
 	backendsMu sync.RWMutex
-	// Map route path to backend connection.
-	backends = make(map[string]*backendConn)
+	// Map route key to a pool of backend connections serving that route.
+	backends = make(map[string]*backendPool)
 	// Pending responses keyed by request ID.
 	pendingMu       sync.RWMutex
 	pendingResponse = make(map[string]chan *pb.HTTPResponse)
@@ -528,21 +546,15 @@ func registeredRoutesSnapshot() []routeSnapshot {
 	defer backendsMu.RUnlock()
 
 	routes := make([]routeSnapshot, 0, len(backends))
-	seen := make(map[string]struct{}, len(backends))
-	for _, conn := range backends {
-		for _, route := range conn.routes {
-			key := backendKey(route.domain, route.path)
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			routes = append(routes, routeSnapshot{
-				Name:      route.name,
-				Domain:    route.domain,
-				Path:      route.path,
-				Protected: route.password != "",
-			})
-		}
+	for _, pool := range backends {
+		route := pool.route
+		routes = append(routes, routeSnapshot{
+			Name:      route.name,
+			Domain:    route.domain,
+			Path:      route.path,
+			Protected: route.password != "",
+			Backends:  len(pool.conns),
+		})
 	}
 	slices.SortFunc(routes, func(a, b routeSnapshot) int {
 		if cmp := strings.Compare(a.Domain, b.Domain); cmp != 0 {
@@ -587,7 +599,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func adminStatusHandler(w http.ResponseWriter, r *http.Request) {
-	if !requireBasicAuth(w, r, adminUsername(), config.AdminPassword, "HARP Admin") {
+	if !requireAdminAccess(w, r) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -601,12 +613,19 @@ func adminStatusHandler(w http.ResponseWriter, r *http.Request) {
 		"status": "healthy",
 		"uptime": time.Since(startTime).Seconds(),
 		"proxy": map[string]interface{}{
-			"grpcPort":      config.GRPCPort,
-			"httpPort":      config.HTTPPort,
-			"cacheEnabled":  config.EnableCache,
-			"cacheType":     config.CacheType,
-			"rateLimit":     config.EnableRateLimit,
-			"maxConcurrent": config.MaxConcurrentRequests,
+			"grpcPort":              config.GRPCPort,
+			"httpPort":              config.HTTPPort,
+			"cacheEnabled":          config.EnableCache,
+			"cacheType":             config.CacheType,
+			"rateLimit":             config.EnableRateLimit,
+			"maxConcurrent":         config.MaxConcurrentRequests,
+			"loadBalancingStrategy": config.LoadBalancingStrategy,
+		},
+		"admin": map[string]interface{}{
+			"path":              adminPath(),
+			"authRequired":      !config.AdminInsecureSkipAuth,
+			"networkRestricted": len(adminAllowedPrefixes) > 0,
+			"allowedCIDRs":      append([]string(nil), config.AdminAllowedCIDRs...),
 		},
 		"routes": registeredRoutesSnapshot(),
 		"counters": map[string]interface{}{
@@ -627,11 +646,43 @@ func adminStatusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func adminUIHandler(w http.ResponseWriter, r *http.Request) {
-	if !requireBasicAuth(w, r, adminUsername(), config.AdminPassword, "HARP Admin") {
+	if !requireAdminAccess(w, r) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, adminHTML(adminPath()))
+}
+
+func requireAdminAccess(w http.ResponseWriter, r *http.Request) bool {
+	if !adminClientAllowed(r) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return false
+	}
+	if config.AdminInsecureSkipAuth {
+		return true
+	}
+	if config.AdminPassword == "" {
+		http.Error(w, "Admin authentication is not configured", http.StatusForbidden)
+		return false
+	}
+	return requireBasicAuth(w, r, adminUsername(), config.AdminPassword, "HARP Admin")
+}
+
+func adminClientAllowed(r *http.Request) bool {
+	if len(adminAllowedPrefixes) == 0 {
+		return true
+	}
+	clientIP := clientIPFromRemoteAddr(r.RemoteAddr)
+	addr, err := netip.ParseAddr(clientIP)
+	if err != nil {
+		return false
+	}
+	for _, prefix := range adminAllowedPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 func adminHTML(path string) string {
@@ -743,7 +794,7 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 			password: authRule.password,
 		})
 		backendsMu.Lock()
-		backends[backendKey(routeDomain, r.Path)] = conn
+		addBackendToPool(backendKey(routeDomain, r.Path), conn.routes[len(conn.routes)-1], conn)
 		backendsMu.Unlock()
 		logDebug("Registered route: %s%s", routeDomain, r.Path)
 	}
@@ -761,7 +812,7 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 				// Cleanup backend registration
 				backendsMu.Lock()
 				for _, route := range conn.routes {
-					delete(backends, backendKey(route.domain, route.path))
+					removeBackendFromPool(backendKey(route.domain, route.path), conn)
 				}
 				backendsMu.Unlock()
 				metrics.BackendsRegistered.Add(-1)
@@ -801,6 +852,39 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 
 func backendKey(domain, path string) string {
 	return domain + "\x00" + path
+}
+
+func addBackendToPool(key string, route registeredRoute, conn *backendConn) {
+	pool, ok := backends[key]
+	if !ok {
+		backends[key] = &backendPool{
+			route: route,
+			conns: []*backendConn{conn},
+		}
+		return
+	}
+	for _, existing := range pool.conns {
+		if existing == conn {
+			return
+		}
+	}
+	pool.conns = append(pool.conns, conn)
+}
+
+func removeBackendFromPool(key string, conn *backendConn) {
+	pool, ok := backends[key]
+	if !ok {
+		return
+	}
+	for i, existing := range pool.conns {
+		if existing == conn {
+			pool.conns = append(pool.conns[:i], pool.conns[i+1:]...)
+			break
+		}
+	}
+	if len(pool.conns) == 0 {
+		delete(backends, key)
+	}
 }
 
 func compileAllowedRegistrationRules(rules []AllowedRegistrationRule) ([]compiledAllowedRegistrationRule, error) {
@@ -963,12 +1047,14 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	bodyStr := string(bodyBytes)
 
 	reqID := uuid.New().String()
-	w.Header().Set("X-Request-ID", reqID)
+	edgeRequestID := requestIDFromRequest(r)
+	w.Header().Set("X-Request-ID", edgeRequestID)
 	isWS := isWebSocketUpgrade(r)
 	forwardHeaders := forwardedRequestHeaders(r)
 	if isWS {
 		forwardHeaders = websocketForwardedRequestHeaders(r)
 	}
+	setHTTPHeaderDefault(forwardHeaders, "X-Request-ID", edgeRequestID)
 	headers := pb.HeaderMapFromHTTP(forwardHeaders)
 	headerValues := pb.HeaderValuesFromHTTP(forwardHeaders)
 	if authenticatedRoute {
@@ -986,7 +1072,9 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		if resp, ok := cacheStore.Get(cacheKey); ok {
 			logDebug("Cache hit for %s", r.URL.String())
 			metrics.CacheHits.Add(1)
-			copyHTTPHeaders(w.Header(), filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues)))
+			respHeaders := filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues))
+			appendVia(respHeaders)
+			copyHTTPHeaders(w.Header(), respHeaders)
 			w.WriteHeader(int(resp.Status))
 			if body := pb.BodyBytesFromProto(resp.Body, resp.BodyBytes); len(body) > 0 {
 				_, _ = w.Write(body)
@@ -1048,6 +1136,7 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		isStream := responseHeaderEnabled(resp, pb.StreamHeader)
 		firstStatus := int(resp.Status)
 		firstHTTPHeaders := filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues))
+		appendVia(firstHTTPHeaders)
 		if isStream {
 			applyStreamDefaultsHTTP(firstHTTPHeaders, streamTypeFromResponse(resp))
 		}
@@ -1107,7 +1196,7 @@ type routeAuthConfig struct {
 }
 
 func matchBackend(host, path string) (*backendConn, string, routeAuthConfig) {
-	var chosen *backendConn
+	var chosenPool *backendPool
 	var matchedRoute string
 	var auth routeAuthConfig
 	var bestLen int
@@ -1115,20 +1204,26 @@ func matchBackend(host, path string) (*backendConn, string, routeAuthConfig) {
 
 	backendsMu.RLock()
 	defer backendsMu.RUnlock()
-	for _, conn := range backends {
-		for _, route := range conn.routes {
-			if route.pattern.MatchString(requestRoute) && len(route.path) > bestLen {
-				chosen = conn
-				matchedRoute = route.path
-				auth = routeAuthConfig{
-					username: route.username,
-					password: route.password,
-				}
-				bestLen = len(route.path)
+	for _, pool := range backends {
+		route := pool.route
+		if route.pattern.MatchString(requestRoute) && len(route.path) > bestLen && len(pool.conns) > 0 {
+			chosenPool = pool
+			matchedRoute = route.path
+			auth = routeAuthConfig{
+				username: route.username,
+				password: route.password,
 			}
+			bestLen = len(route.path)
 		}
 	}
-	return chosen, matchedRoute, auth
+	if chosenPool == nil {
+		return nil, "", routeAuthConfig{}
+	}
+	if config.LoadBalancingStrategy == loadBalancingFirst {
+		return chosenPool.conns[0], matchedRoute, auth
+	}
+	idx := atomic.AddUint64(&chosenPool.next, 1) - 1
+	return chosenPool.conns[int(idx%uint64(len(chosenPool.conns)))], matchedRoute, auth
 }
 
 func routeTarget(host, path string) string {
@@ -1160,6 +1255,16 @@ func requireBasicAuth(w http.ResponseWriter, r *http.Request, username, password
 	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm=%q, charset="UTF-8"`, realm))
 	http.Error(w, "Unauthorized", http.StatusUnauthorized)
 	return false
+}
+
+func requestIDFromRequest(r *http.Request) string {
+	for _, value := range r.Header.Values("X-Request-ID") {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return uuid.New().String()
 }
 
 func secureCompare(got, want string) bool {
@@ -1354,7 +1459,11 @@ func addForwardedHeaders(headers http.Header, r *http.Request) {
 		proto = "https"
 	}
 	setHTTPHeaderDefault(headers, "X-Forwarded-Proto", proto)
+	if port := forwardedPort(r.Host, proto); port != "" {
+		setHTTPHeaderDefault(headers, "X-Forwarded-Port", port)
+	}
 	appendForwardedHeader(headers, clientIP, proto, r.Host)
+	appendVia(headers)
 }
 
 func copyHeaderIfPresent(dst, src http.Header, key string) {
@@ -1411,6 +1520,27 @@ func appendHeaderValue(headers http.Header, key, value string) {
 		return
 	}
 	headers.Add(key, value)
+}
+
+func appendVia(headers http.Header) {
+	headers.Add("Via", "1.1 harp")
+}
+
+func forwardedPort(host, proto string) string {
+	if _, port, err := net.SplitHostPort(host); err == nil {
+		return port
+	}
+	if strings.Contains(host, ":") {
+		return ""
+	}
+	switch proto {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	default:
+		return ""
+	}
 }
 
 func appendForwardedHeader(headers http.Header, clientIP, proto, host string) {
@@ -1621,11 +1751,18 @@ func loadConfig(path string) {
 	if config.GracefulShutdownDelay == "" {
 		config.GracefulShutdownDelay = "10s"
 	}
+	if strategy := normalizeLoadBalancingStrategy(config.LoadBalancingStrategy); strategy != "" {
+		config.LoadBalancingStrategy = strategy
+	}
 
 	if err := validateConfig(config); err != nil {
 		log.Fatalf("Config error: %v", err)
 	}
 	allowedRegistrationRules, err = compileAllowedRegistrationRules(config.AllowedRegistration)
+	if err != nil {
+		log.Fatalf("Config error: %v", err)
+	}
+	adminAllowedPrefixes, err = compileAdminAllowedCIDRs(config.AdminAllowedCIDRs)
 	if err != nil {
 		log.Fatalf("Config error: %v", err)
 	}
@@ -1642,6 +1779,12 @@ func validateConfig(config Config) error {
 	}
 	if config.EnableHTTP3 && !config.EnableHTTPS {
 		errs = append(errs, errors.New("enableHTTP3 requires enableHTTPS"))
+	}
+	if normalizeLoadBalancingStrategy(config.LoadBalancingStrategy) == "" {
+		errs = append(errs, fmt.Errorf("invalid loadBalancingStrategy %q: use %q or %q", config.LoadBalancingStrategy, loadBalancingRoundRobin, loadBalancingFirst))
+	}
+	if config.EnableAdminUI && !config.AdminInsecureSkipAuth && config.AdminPassword == "" {
+		errs = append(errs, errors.New("enableAdminUI requires adminPassword unless adminInsecureSkipAuth is true"))
 	}
 	for _, field := range []struct {
 		name  string
@@ -1664,8 +1807,46 @@ func validateConfig(config Config) error {
 	if _, err := compileAllowedRegistrationRules(config.AllowedRegistration); err != nil {
 		errs = append(errs, err)
 	}
+	if _, err := compileAdminAllowedCIDRs(config.AdminAllowedCIDRs); err != nil {
+		errs = append(errs, err)
+	}
 
 	return errors.Join(errs...)
+}
+
+func normalizeLoadBalancingStrategy(strategy string) string {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "", loadBalancingRoundRobin, "round-robin", "roundrobin":
+		return loadBalancingRoundRobin
+	case loadBalancingFirst:
+		return loadBalancingFirst
+	default:
+		return ""
+	}
+}
+
+func compileAdminAllowedCIDRs(values []string) ([]netip.Prefix, error) {
+	prefixes := make([]netip.Prefix, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if strings.Contains(value, "/") {
+			prefix, err := netip.ParsePrefix(value)
+			if err != nil {
+				return nil, fmt.Errorf("invalid adminAllowedCIDRs entry %q: %w", value, err)
+			}
+			prefixes = append(prefixes, prefix.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid adminAllowedCIDRs entry %q: %w", value, err)
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return prefixes, nil
 }
 
 func main() {

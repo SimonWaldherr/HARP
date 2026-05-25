@@ -108,8 +108,8 @@ button {
     <article class="panel span-8">
       <h2>Routes</h2>
       <table>
-        <thead><tr><th>Name</th><th>Domain</th><th>Path</th><th>Auth</th></tr></thead>
-        <tbody id="routes"><tr><td colspan="4" class="empty">No routes registered</td></tr></tbody>
+        <thead><tr><th>Name</th><th>Domain</th><th>Path</th><th>Backends</th><th>Auth</th></tr></thead>
+        <tbody id="routes"><tr><td colspan="5" class="empty">No routes registered</td></tr></tbody>
       </table>
     </article>
 
@@ -117,6 +117,11 @@ button {
       <h2>Runtime</h2>
       <div class="runtime" id="runtime"></div>
       <div class="toolbar"><span id="updated">Waiting for data</span><button id="refresh">Refresh</button></div>
+    </article>
+
+    <article class="panel span-12">
+      <h2>Configuration</h2>
+      <div class="runtime" id="config"></div>
     </article>
   </section>
 </main>
@@ -143,9 +148,10 @@ function render(data) {
     "<td>" + escapeHTML(route.name || "unnamed") + "</td>" +
     "<td><code>" + escapeHTML(route.domain || "") + "</code></td>" +
     "<td><code>" + escapeHTML(route.path || "") + "</code></td>" +
+    "<td>" + fmt(route.backends) + "</td>" +
     "<td>" + (route.protected ? "Basic" : "Open") + "</td>" +
     "</tr>"
-  ).join("") : "<tr><td colspan=\"4\" class=\"empty\">No routes registered</td></tr>";
+  ).join("") : "<tr><td colspan=\"5\" class=\"empty\">No routes registered</td></tr>";
 
   const runtime = [
     ["Goroutines", "/sched/goroutines:goroutines"],
@@ -155,6 +161,17 @@ function render(data) {
   ];
   $("runtime").innerHTML = runtime.map(([label, key]) =>
     "<div><strong>" + fmt(metricKey(data, key)) + "</strong><span class=\"label\">" + label + "</span></div>"
+  ).join("");
+  const proxy = data.proxy || {};
+  const admin = data.admin || {};
+  const configItems = [
+    ["Load balancing", proxy.loadBalancingStrategy || "round_robin"],
+    ["Cache", proxy.cacheEnabled ? (proxy.cacheType || "enabled") : "disabled"],
+    ["Admin auth", admin.authRequired ? "required" : "disabled"],
+    ["Admin network", admin.networkRestricted ? "restricted" : "open"]
+  ];
+  $("config").innerHTML = configItems.map(([label, value]) =>
+    "<div><strong>" + escapeHTML(value) + "</strong><span class=\"label\">" + label + "</span></div>"
   ).join("");
   $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
 }

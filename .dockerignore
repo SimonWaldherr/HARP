@@ -1,0 +1,9 @@
+.git
+.github
+.DS_Store
+bin
+cache
+coverage.out
+*.log
+deploy/**/*.local.json
+docs/**/*.tmp

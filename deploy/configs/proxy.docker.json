@@ -11,16 +11,13 @@
   "enableHTTP3": false,
   "enableCache": true,
   "cacheType": "memory",
-  "diskCacheDir": "./cache",
+  "diskCacheDir": "/var/lib/harp/cache",
   "cacheTTL": "30m",
   "allowedRegistration": [
-    { "route": "/foobar/.*$", "key": "secret1" },
-    { "route": "/lorem/.*$",  "key": "ipsum-key" },
-    { "route": "/.*$",       "key": "master-key" }
+    { "route": "/.*$", "key": "change-me" }
   ],
-  "logLevel": "DEBUG",
+  "logLevel": "INFO",
   "loadBalancingStrategy": "round_robin",
-
   "maxConcurrentRequests": 1000,
   "requestTimeout": "30s",
   "enableMetrics": true,

@@ -1,33 +1,39 @@
-.PHONY: all build build-proxy build-gateway build-demos fmt fmt-all vet vet-all lint test test-all test-verbose test-cover \
+.PHONY: all build build-proxy build-gateway build-tools build-demos docker-build docker-compose-config fmt fmt-all vet vet-all lint test test-all test-verbose test-cover \
 run run-proxy run-gateway run-demo-simple run-demo-complex run-demo-enhanced \
        run-demo-multi run-demo-remote-helper run-demo-static run-demo-sse \
-       run-demo-websocket demo demo-admin clean proto help
+       run-demo-websocket run-demo-headers run-demo-webhook-catcher demo demo-admin clean proto help
 
 # ── Variables ────────────────────────────────────────────────────────────────
 BINARY       := bin/harp-proxy
 GATEWAY      := bin/harp-gateway
+HARPCTL      := bin/harpctl
 GO           := go
 GOFLAGS      ?=
 CONFIG       ?= config.json
 ADMIN_CONFIG ?= demos/admin-ui/config.json
 GATEWAY_CFG  ?= cmd/harp-gateway/gateway-example.json
 PROXY_ADDR   ?= localhost:50054
+DOCKER       ?= docker
+DOCKER_IMAGE ?= harp:local
 
 # Demo binaries
-DEMOS := simple-go complex-harp-server enhanced-go multi-service-go static-wrapper-go sse-go websocket-go
+DEMOS := simple-go complex-harp-server enhanced-go multi-service-go static-wrapper-go sse-go websocket-go headers-go webhook-catcher-go
 MODULE_DIRS := . harp harpserver demos/remote-helper-go demos/advanced-enterprise
 
 # ── Default target ───────────────────────────────────────────────────────────
 all: fmt-all vet-all test-all build ## Format, vet, test, and build everything
 
 # ── Build ────────────────────────────────────────────────────────────────────
-build: build-proxy build-gateway build-demos ## Build proxy, gateway, and all demos
+build: build-proxy build-gateway build-tools build-demos ## Build proxy, tools, gateway, and all demos
 
 build-proxy: ## Build the HARP proxy binary
 	$(GO) build $(GOFLAGS) -o $(BINARY) .
 
 build-gateway: ## Build the harp-gateway agent
 	$(GO) build $(GOFLAGS) -o $(GATEWAY) ./cmd/harp-gateway
+
+build-tools: ## Build ready-to-use CLI tools
+	$(GO) build $(GOFLAGS) -o $(HARPCTL) ./cmd/harpctl
 
 build-demos: ## Build all demo backends
 	@for demo in $(DEMOS); do \
@@ -38,6 +44,12 @@ build-demos: ## Build all demo backends
 		echo "Building demos/remote-helper-go ..."; \
 		cd demos/remote-helper-go && $(GO) build $(GOFLAGS) -o ../../bin/demo-remote-helper-go .; \
 	fi
+
+docker-build: ## Build the HARP container image
+	$(DOCKER) build -t $(DOCKER_IMAGE) .
+
+docker-compose-config: ## Validate docker-compose.yml syntax
+	$(DOCKER) compose config >/dev/null
 
 # ── Code quality ─────────────────────────────────────────────────────────────
 fmt: ## Run gofmt on all Go files
@@ -117,6 +129,12 @@ run-demo-sse: ## Run the SSE streaming demo (proxy must be running)
 run-demo-websocket: ## Run the direct WebSocket demo
 	$(GO) run ./demos/websocket-go
 
+run-demo-headers: ## Run the forwarded-header inspection demo
+	$(GO) run ./demos/headers-go -proxy $(PROXY_ADDR)
+
+run-demo-webhook-catcher: ## Run the ready-to-use webhook catcher demo
+	$(GO) run ./demos/webhook-catcher-go -proxy $(PROXY_ADDR)
+
 # ── Demo: full workflow ──────────────────────────────────────────────────────
 demo: build-proxy ## Run proxy + simple demo, then curl a test request
 	@echo "=== Starting HARP proxy ==="
@@ -173,7 +191,7 @@ proto: ## Regenerate protobuf/gRPC code from harp.proto
 
 # ── Maintenance ──────────────────────────────────────────────────────────────
 clean: ## Remove build artifacts
-	rm -f $(BINARY) $(GATEWAY) coverage.out
+	rm -f $(BINARY) $(GATEWAY) $(HARPCTL) coverage.out
 	rm -f bin/demo-*
 
 deps: ## Download and tidy dependencies

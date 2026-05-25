@@ -112,7 +112,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, chosen *backendConn
 }
 
 func writeHTTPResponse(w http.ResponseWriter, resp *pb.HTTPResponse) {
-	copyHTTPHeaders(w.Header(), filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues)))
+	headers := filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues))
+	appendVia(headers)
+	copyHTTPHeaders(w.Header(), headers)
 	status := int(resp.Status)
 	if status == 0 {
 		status = http.StatusBadGateway

@@ -290,9 +290,27 @@ func convertProtoToHTTPRequest(protoReq *pb.HTTPRequest) (*http.Request, error) 
 		return nil, err
 	}
 	req.Header = pb.HTTPHeaderFromProto(protoReq.Headers, protoReq.HeaderValues)
-	// You can set other fields as needed.
+	if host := forwardedHost(req.Header); host != "" {
+		req.Host = host
+	}
 	req.URL = parsedURL
 	return req, nil
+}
+
+func forwardedHost(headers http.Header) string {
+	if host := firstHeaderValue(headers.Get("X-Forwarded-Host")); host != "" {
+		return host
+	}
+	return firstHeaderValue(headers.Get("Host"))
+}
+
+func firstHeaderValue(value string) string {
+	for _, part := range strings.Split(value, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // ResponseRecorder is a minimal implementation of http.ResponseWriter.

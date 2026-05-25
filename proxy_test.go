@@ -287,6 +287,7 @@ func TestGetCacheKeyDeterministic(t *testing.T) {
 func TestLoadConfigDefaults(t *testing.T) {
 	// Save original config
 	origConfig := config
+	origAdminPrefixes := adminAllowedPrefixes
 
 	// Create a minimal temporary config
 	tmpFile, err := os.CreateTemp("", "harp-config-*.json")
@@ -320,18 +321,25 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if config.GracefulShutdownDelay != "10s" {
 		t.Errorf("expected default GracefulShutdownDelay='10s', got %q", config.GracefulShutdownDelay)
 	}
+	if config.LoadBalancingStrategy != loadBalancingRoundRobin {
+		t.Errorf("expected default LoadBalancingStrategy=%q, got %q", loadBalancingRoundRobin, config.LoadBalancingStrategy)
+	}
 
 	// Restore config
 	config = origConfig
+	adminAllowedPrefixes = origAdminPrefixes
 }
 
 func TestValidateConfigCollectsErrors(t *testing.T) {
 	err := validateConfig(Config{
-		EnableGRPCTLS: true,
-		EnableHTTPS:   true,
-		EnableHTTP3:   true,
-		CacheTTL:      "not-a-duration",
-		ReadTimeout:   "still-not-a-duration",
+		EnableGRPCTLS:         true,
+		EnableHTTPS:           true,
+		EnableHTTP3:           true,
+		EnableAdminUI:         true,
+		CacheTTL:              "not-a-duration",
+		ReadTimeout:           "still-not-a-duration",
+		LoadBalancingStrategy: "random",
+		AdminAllowedCIDRs:     []string{"not-a-cidr"},
 		AllowedRegistration: []AllowedRegistrationRule{
 			{Route: "[", Key: "secret"},
 		},
@@ -344,6 +352,9 @@ func TestValidateConfigCollectsErrors(t *testing.T) {
 	for _, want := range []string{
 		"enableGRPCTLS requires grpcTLSCert and grpcTLSKey",
 		"enableHTTPS requires httpsCert and httpsKey",
+		"enableAdminUI requires adminPassword unless adminInsecureSkipAuth is true",
+		"invalid loadBalancingStrategy",
+		"invalid adminAllowedCIDRs entry",
 		"invalid cacheTTL",
 		"invalid readTimeout",
 		"invalid regex in allowedRegistration route",
@@ -567,6 +578,7 @@ func TestAdminHandlersRespectConfig(t *testing.T) {
 
 	config.EnableAdminUI = true
 	config.AdminPath = "/admin"
+	config.AdminInsecureSkipAuth = true
 	mux = http.NewServeMux()
 	registerAdminHandlers(mux)
 
@@ -587,6 +599,7 @@ func TestAdminHandlersRequireConfiguredPassword(t *testing.T) {
 	config.EnableAdminUI = true
 	config.AdminPath = "/admin"
 	config.AdminPassword = "secret"
+	config.AdminInsecureSkipAuth = false
 	mux := http.NewServeMux()
 	registerAdminHandlers(mux)
 
@@ -603,6 +616,63 @@ func TestAdminHandlersRequireConfiguredPassword(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected authenticated admin request to return 200, got %d", rec.Code)
+	}
+}
+
+func TestAdminHandlersRejectMissingPasswordUnlessExplicitlyDisabled(t *testing.T) {
+	origConfig := config
+	origPrefixes := adminAllowedPrefixes
+	t.Cleanup(func() {
+		config = origConfig
+		adminAllowedPrefixes = origPrefixes
+	})
+
+	config.EnableAdminUI = true
+	config.AdminPath = "/admin"
+	config.AdminPassword = ""
+	config.AdminInsecureSkipAuth = false
+	adminAllowedPrefixes = nil
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	adminUIHandler(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected missing admin password to return 403, got %d", rec.Code)
+	}
+}
+
+func TestAdminHandlersRespectAllowedCIDRs(t *testing.T) {
+	origConfig := config
+	origPrefixes := adminAllowedPrefixes
+	t.Cleanup(func() {
+		config = origConfig
+		adminAllowedPrefixes = origPrefixes
+	})
+
+	config.AdminPassword = "secret"
+	config.AdminInsecureSkipAuth = false
+	var err error
+	adminAllowedPrefixes, err = compileAdminAllowedCIDRs([]string{"127.0.0.1/32"})
+	if err != nil {
+		t.Fatalf("unexpected CIDR compile error: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.RemoteAddr = "192.0.2.1:1234"
+	req.SetBasicAuth("admin", "secret")
+	adminUIHandler(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected disallowed admin IP to return 403, got %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.SetBasicAuth("admin", "secret")
+	adminUIHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected allowed admin IP to return 200, got %d", rec.Code)
 	}
 }
 
@@ -710,8 +780,14 @@ func TestForwardedRequestHeadersStripHopByHopAndAddProxyHeaders(t *testing.T) {
 	if got.Get("X-Forwarded-Proto") != "https" {
 		t.Fatalf("unexpected X-Forwarded-Proto: %q", got.Get("X-Forwarded-Proto"))
 	}
+	if got.Get("X-Forwarded-Port") != "443" {
+		t.Fatalf("unexpected X-Forwarded-Port: %q", got.Get("X-Forwarded-Port"))
+	}
 	if got.Get("Forwarded") != `for="203.0.113.7";proto="https";host="public.example.test"` {
 		t.Fatalf("unexpected Forwarded header: %q", got.Get("Forwarded"))
+	}
+	if got.Get("Via") != "1.1 harp" {
+		t.Fatalf("unexpected Via header: %q", got.Get("Via"))
 	}
 }
 
@@ -721,6 +797,8 @@ func TestForwardedRequestHeadersPreserveExistingForwardedDefaults(t *testing.T) 
 	req.RemoteAddr = "203.0.113.9:1234"
 	req.Header.Set("X-Forwarded-Host", "edge.example.test")
 	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-Port", "8443")
+	req.Header.Set("Via", "1.1 edge")
 
 	got := forwardedRequestHeaders(req)
 
@@ -730,8 +808,52 @@ func TestForwardedRequestHeadersPreserveExistingForwardedDefaults(t *testing.T) 
 	if got.Get("X-Forwarded-Proto") != "https" {
 		t.Fatalf("expected existing X-Forwarded-Proto to be preserved, got %q", got.Get("X-Forwarded-Proto"))
 	}
+	if got.Get("X-Forwarded-Port") != "8443" {
+		t.Fatalf("expected existing X-Forwarded-Port to be preserved, got %q", got.Get("X-Forwarded-Port"))
+	}
 	if got.Get("Forwarded") != `for="203.0.113.9";proto="http";host="public.example.test"` {
 		t.Fatalf("unexpected Forwarded header: %q", got.Get("Forwarded"))
+	}
+	if values := got.Values("Via"); len(values) != 2 || values[0] != "1.1 edge" || values[1] != "1.1 harp" {
+		t.Fatalf("unexpected Via chain: %#v", values)
+	}
+}
+
+func TestForwardedPort(t *testing.T) {
+	tests := []struct {
+		name  string
+		host  string
+		proto string
+		want  string
+	}{
+		{name: "explicit http port", host: "public.example.test:8080", proto: "http", want: "8080"},
+		{name: "default http", host: "public.example.test", proto: "http", want: "80"},
+		{name: "default https", host: "public.example.test", proto: "https", want: "443"},
+		{name: "ipv6 without port", host: "::1", proto: "http", want: ""},
+		{name: "ipv6 with port", host: "[::1]:8443", proto: "https", want: "8443"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := forwardedPort(tc.host, tc.proto); got != tc.want {
+				t.Fatalf("forwardedPort(%q, %q) = %q, want %q", tc.host, tc.proto, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRequestIDFromRequestUsesIncomingHeaderOrGeneratesID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://public.example.test/app", nil)
+	req.Header.Set("X-Request-ID", " client-request-1 ")
+
+	if got := requestIDFromRequest(req); got != "client-request-1" {
+		t.Fatalf("expected incoming request id, got %q", got)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "http://public.example.test/app", nil)
+	got := requestIDFromRequest(req)
+	if strings.TrimSpace(got) == "" {
+		t.Fatal("expected generated request id")
 	}
 }
 
@@ -763,8 +885,14 @@ func TestWebSocketForwardedRequestHeadersPreserveUpgradeHeaders(t *testing.T) {
 	if got.Get("X-Forwarded-For") != "203.0.113.11" {
 		t.Fatalf("unexpected X-Forwarded-For: %q", got.Get("X-Forwarded-For"))
 	}
+	if got.Get("X-Forwarded-Port") != "80" {
+		t.Fatalf("unexpected X-Forwarded-Port: %q", got.Get("X-Forwarded-Port"))
+	}
 	if got.Get("Forwarded") != `for="203.0.113.11";proto="http";host="public.example.test"` {
 		t.Fatalf("unexpected Forwarded header: %q", got.Get("Forwarded"))
+	}
+	if got.Get("Via") != "1.1 harp" {
+		t.Fatalf("unexpected Via header: %q", got.Get("Via"))
 	}
 }
 
@@ -807,6 +935,8 @@ func TestAdminStatusHandler(t *testing.T) {
 		CacheType:             "memory",
 		EnableRateLimit:       true,
 		MaxConcurrentRequests: 1000,
+		AdminInsecureSkipAuth: true,
+		LoadBalancingStrategy: loadBalancingRoundRobin,
 	}
 	metrics = newTestMetrics()
 	metrics.RequestsTotal.Add(3)
@@ -884,9 +1014,15 @@ func TestMatchBackendUsesHostAndPath(t *testing.T) {
 			pattern: regexp.MustCompile(`other\.com/api`),
 		}},
 	}
-	backends = map[string]*backendConn{
-		backendKey(`example\.com`, "/api"): exampleBackend,
-		backendKey(`other\.com`, "/api"):   otherBackend,
+	backends = map[string]*backendPool{
+		backendKey(`example\.com`, "/api"): {
+			route: exampleBackend.routes[0],
+			conns: []*backendConn{exampleBackend},
+		},
+		backendKey(`other\.com`, "/api"): {
+			route: otherBackend.routes[0],
+			conns: []*backendConn{otherBackend},
+		},
 	}
 	backendsMu.Unlock()
 	t.Cleanup(func() {
@@ -917,6 +1053,117 @@ func TestMatchBackendUsesHostAndPath(t *testing.T) {
 	got, route, _ = matchBackend("missing.example", "/api/users")
 	if got != nil || route != "" {
 		t.Fatalf("expected no backend for unmatched host, got %#v route %q", got, route)
+	}
+}
+
+func TestMatchBackendRoundRobinWithinRoutePool(t *testing.T) {
+	origConfig := config
+	origBackends := backends
+	route := registeredRoute{
+		name:    "api",
+		domain:  `example\.com`,
+		path:    "/api",
+		pattern: regexp.MustCompile(`example\.com/api`),
+	}
+	first := &backendConn{routes: []registeredRoute{route}}
+	second := &backendConn{routes: []registeredRoute{route}}
+	backendsMu.Lock()
+	backends = map[string]*backendPool{
+		backendKey(`example\.com`, "/api"): {
+			route: route,
+			conns: []*backendConn{first, second},
+		},
+	}
+	backendsMu.Unlock()
+	t.Cleanup(func() {
+		config = origConfig
+		backendsMu.Lock()
+		backends = origBackends
+		backendsMu.Unlock()
+	})
+	config.LoadBalancingStrategy = loadBalancingRoundRobin
+
+	got, routePath, _ := matchBackend("example.com", "/api/users")
+	if got != first || routePath != "/api" {
+		t.Fatalf("first request should select first backend, got %#v route %q", got, routePath)
+	}
+	got, routePath, _ = matchBackend("example.com", "/api/users")
+	if got != second || routePath != "/api" {
+		t.Fatalf("second request should select second backend, got %#v route %q", got, routePath)
+	}
+	got, routePath, _ = matchBackend("example.com", "/api/users")
+	if got != first || routePath != "/api" {
+		t.Fatalf("third request should wrap to first backend, got %#v route %q", got, routePath)
+	}
+}
+
+func TestMatchBackendFirstStrategy(t *testing.T) {
+	origConfig := config
+	origBackends := backends
+	route := registeredRoute{
+		name:    "api",
+		domain:  `example\.com`,
+		path:    "/api",
+		pattern: regexp.MustCompile(`example\.com/api`),
+	}
+	first := &backendConn{routes: []registeredRoute{route}}
+	second := &backendConn{routes: []registeredRoute{route}}
+	backendsMu.Lock()
+	backends = map[string]*backendPool{
+		backendKey(`example\.com`, "/api"): {
+			route: route,
+			conns: []*backendConn{first, second},
+		},
+	}
+	backendsMu.Unlock()
+	t.Cleanup(func() {
+		config = origConfig
+		backendsMu.Lock()
+		backends = origBackends
+		backendsMu.Unlock()
+	})
+	config.LoadBalancingStrategy = loadBalancingFirst
+
+	for i := 0; i < 3; i++ {
+		got, routePath, _ := matchBackend("example.com", "/api/users")
+		if got != first || routePath != "/api" {
+			t.Fatalf("request %d should select first backend, got %#v route %q", i+1, got, routePath)
+		}
+	}
+}
+
+func TestRegisteredRoutesSnapshotIncludesBackendPoolSize(t *testing.T) {
+	origBackends := backends
+	route := registeredRoute{
+		name:     "api",
+		domain:   `example\.com`,
+		path:     "/api",
+		pattern:  regexp.MustCompile(`example\.com/api`),
+		password: "route-password",
+	}
+	backendsMu.Lock()
+	backends = map[string]*backendPool{
+		backendKey(`example\.com`, "/api"): {
+			route: route,
+			conns: []*backendConn{{}, {}},
+		},
+	}
+	backendsMu.Unlock()
+	t.Cleanup(func() {
+		backendsMu.Lock()
+		backends = origBackends
+		backendsMu.Unlock()
+	})
+
+	routes := registeredRoutesSnapshot()
+	if len(routes) != 1 {
+		t.Fatalf("expected one route snapshot, got %#v", routes)
+	}
+	if routes[0].Backends != 2 {
+		t.Fatalf("expected backend pool size 2, got %d", routes[0].Backends)
+	}
+	if !routes[0].Protected {
+		t.Fatal("expected protected route snapshot")
 	}
 }
 

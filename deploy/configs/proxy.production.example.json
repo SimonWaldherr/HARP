@@ -11,20 +11,17 @@
   "enableHTTP3": false,
   "enableCache": true,
   "cacheType": "memory",
-  "diskCacheDir": "./cache",
-  "cacheTTL": "30m",
+  "diskCacheDir": "/var/lib/harp/cache",
+  "cacheTTL": "10m",
   "allowedRegistration": [
-    { "route": "/foobar/.*$", "key": "secret1" },
-    { "route": "/lorem/.*$",  "key": "ipsum-key" },
-    { "route": "/.*$",       "key": "master-key" }
+    { "route": "/api/.*$", "key": "replace-with-long-random-route-key" }
   ],
-  "logLevel": "DEBUG",
+  "logLevel": "INFO",
   "loadBalancingStrategy": "round_robin",
-
   "maxConcurrentRequests": 1000,
   "requestTimeout": "30s",
   "enableMetrics": true,
-  "metricsPort": ":9091",
+  "metricsPort": "127.0.0.1:9091",
   "enableHealthCheck": true,
   "healthCheckPath": "/health",
   "connectionPoolSize": 100,
@@ -37,12 +34,12 @@
   "idleTimeout": "120s",
   "maxRequestBodySize": 10485760,
   "enableCORS": false,
-  "corsAllowedOrigins": "*",
+  "corsAllowedOrigins": "https://example.com",
   "gracefulShutdownDelay": "10s",
-  "enableAdminUI": false,
+  "enableAdminUI": true,
   "adminPath": "/admin",
   "adminUsername": "admin",
-  "adminPassword": "",
+  "adminPassword": "replace-with-long-random-admin-password",
   "adminInsecureSkipAuth": false,
-  "adminAllowedCIDRs": []
+  "adminAllowedCIDRs": ["127.0.0.1/32", "::1/128"]
 }

@@ -34,6 +34,7 @@ Unlike traditional reverse proxies (nginx, HAProxy, Traefik) that require the ba
 - [Configuration](#configuration)
 - [Makefile](#makefile)
 - [Examples](#examples)
+- [Production & Deployment](#production--deployment)
 - [Using the Web Handler Wrapper](#using-the-web-handler-wrapper)
 - [HARP Gateway Agent](#harp-gateway-agent)
 - [Integration Guide](./INTEGRATION.md)
@@ -55,6 +56,7 @@ HARP allows your internal servers (or devices like Raspberry Pis) to securely ex
 - **Request body size limits** to prevent abuse and OOM
 - **CORS support** with configurable allowed origins
 - **X-Request-ID tracing** — every proxied response includes a unique request ID header
+- **Round-robin load balancing** across multiple backends registered for the same route
 - **Per-route metrics** — track request counts per route via `/metrics`
 - **Graceful shutdown** — drains connections on SIGINT/SIGTERM
 - **Health check endpoint** at `/health` with uptime and backend count
@@ -91,6 +93,9 @@ HARP allows your internal servers (or devices like Raspberry Pis) to securely ex
 
 3. **Response Relay & Caching:**  
    The backend processes the request and returns a response via gRPC, which the proxy relays to the client. Responses may also be cached.
+
+4. **Load Balancing:**
+   If multiple backend connections register the same domain/path route, HARP keeps them in one route pool and selects a backend according to `loadBalancingStrategy`. Route matching still uses the longest matching path first, so specific routes win before balancing is applied.
 
 ---
 
@@ -130,6 +135,18 @@ sequenceDiagram
 - [Go](https://golang.org) (v1.16 or later)
 - [protoc](https://grpc.io/docs/protoc-installation/) (for regenerating proto code if needed)
 - (Optional) QUIC-Go for HTTP/3 support
+- (Optional) Docker / Docker Compose for the fastest local demo
+
+### Docker Quickstart
+
+```bash
+docker compose up --build
+curl http://localhost:8080/inspect/headers
+curl -X POST http://localhost:8080/hooks/demo -d '{"hello":"world"}'
+curl http://localhost:8080/hooks/events
+```
+
+See [docs/QUICKSTART.md](docs/QUICKSTART.md) for the full quickstart.
 
 ### Build & Run
 
@@ -175,6 +192,7 @@ The `config.json` file controls the proxy behavior:
 | `enableCache` | bool | `true` | Enable response caching |
 | `cacheType` | string | `memory` | `memory` or `disk` |
 | `cacheTTL` | string | `30m` | Cache entry TTL (Go duration) |
+| `loadBalancingStrategy` | string | `round_robin` | Backend selection for identical routes: `round_robin` or `first` |
 | `enableRateLimit` | bool | `true` | Enable per-IP rate limiting |
 | `rateLimitPerSecond` | int | `100` | Max requests per second per IP |
 | `maxRequestBodySize` | int | `10485760` | Max request body in bytes (10 MB) |
@@ -183,7 +201,9 @@ The `config.json` file controls the proxy behavior:
 | `enableAdminUI` | bool | `false` | Enable the built-in web admin dashboard |
 | `adminPath` | string | `/admin` | Admin dashboard path when enabled |
 | `adminUsername` | string | `admin` | Admin dashboard Basic Auth username |
-| `adminPassword` | string | empty | Admin dashboard Basic Auth password; empty disables admin auth |
+| `adminPassword` | string | empty | Admin dashboard Basic Auth password; required when `enableAdminUI` is true unless `adminInsecureSkipAuth` is true |
+| `adminInsecureSkipAuth` | bool | `false` | Explicitly disable Admin Basic Auth; intended only for isolated local testing |
+| `adminAllowedCIDRs` | array | `[]` | Optional IP/CIDR allowlist for Admin UI and Admin API |
 | `enableHealthCheck` | bool | `true` | Enable `/health`, `/healthz`, `/livez`, and `/readyz` endpoints |
 | `enableMetrics` | bool | `true` | Enable `/metrics` + pprof |
 | `metricsPort` | string | `:9091` | Metrics server listen address |
@@ -218,6 +238,7 @@ A `Makefile` is provided for common workflows:
 make              # fmt + vet + test + build
 make build        # Build proxy, gateway, and all demo binaries
 make build-gateway # Build just the harp-gateway agent
+make build-tools   # Build ready-to-use CLI tools such as harpctl
 make test         # Run all tests
 make test-cover   # Tests with coverage report
 make test-race    # Tests with Go race detector
@@ -269,6 +290,36 @@ The **demos/** folder includes several backend examples:
 8. **WebSocket Demo (demos/websocket-go):**
    Exposes a WebSocket echo server through HARP's full-duplex upgrade tunnel.
 
+9. **Header Inspection Demo (demos/headers-go):**
+   Shows `Forwarded`, `X-Forwarded-*`, `Via`, and `X-Request-ID` as seen by a
+   backend behind HARP.
+
+10. **Webhook Catcher Demo (demos/webhook-catcher-go):**
+    A ready-to-use webhook sink that accepts `POST`, `PUT`, and `PATCH`
+    requests under `/hooks/` and keeps recent events in memory for inspection.
+
+---
+
+## Production & Deployment
+
+Deployment assets are included:
+
+- [Dockerfile](Dockerfile)
+- [docker-compose.yml](docker-compose.yml)
+- [systemd units](deploy/systemd/)
+- [production config example](deploy/configs/proxy.production.example.json)
+
+Read [docs/PRODUCTION.md](docs/PRODUCTION.md) before exposing HARP publicly.
+For positioning, see [docs/COMPARISON.md](docs/COMPARISON.md) and
+[docs/PITCH.md](docs/PITCH.md). For release work, see
+[docs/RELEASE.md](docs/RELEASE.md).
+
+Project process files:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [SECURITY.md](SECURITY.md)
+- [CHANGELOG.md](CHANGELOG.md)
+
 ---
 
 ## Using the Web Handler Wrapper
@@ -301,6 +352,29 @@ server.ListenAndServeHarp()
 
 Streaming routes support `http.Flusher`; SSE handlers can write `data: ...\n\n`
 events and call `Flush()` just like they would behind a normal Go HTTP server.
+
+Middleware follows standard Go `net/http` practice: wrap the handler before it
+is registered with HARP. This keeps authentication, logging, compression,
+request shaping, and custom headers composable without a HARP-specific
+middleware DSL.
+
+```go
+func requestLogger(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        log.Printf("%s %s request_id=%s", r.Method, r.URL.Path, r.Header.Get("X-Request-ID"))
+        next.ServeHTTP(w, r)
+    })
+}
+
+server := &harpserver.BackendServer{
+    Name:     "MyService",
+    ProxyURL: "proxy.example.com:50054",
+    Key:      "master-key",
+    Domain:   ".*",
+    Route:    "/",
+    Handler:  requestLogger(myMux),
+}
+```
 
 ---
 
@@ -416,12 +490,45 @@ HARP behaves like a standard reverse proxy for forwarded request metadata:
 hop-by-hop headers such as `Connection`, `Keep-Alive`, `TE`, `Trailer`,
 `Transfer-Encoding`, `Upgrade`, and custom headers named by `Connection` are
 stripped before normal HTTP requests are sent to a backend. `Forwarded`,
-`X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto` are populated so
-backends can reconstruct the public request context. WebSocket upgrades keep
+`X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`,
+`X-Forwarded-Port`, and `Via` are populated so backends can reconstruct the
+public request context and identify the proxy chain. WebSocket upgrades keep
 `Connection` and `Upgrade` only on the dedicated WebSocket tunnel path.
+`X-Request-ID` is propagated when supplied by the client and generated otherwise;
+backend handlers also see `r.Host` from `X-Forwarded-Host` when available.
 
 See [cmd/harp-gateway/gateway-example.json](cmd/harp-gateway/gateway-example.json) for the full example config.
 For a ready-to-use home-LLM setup, see [demos/llm-gateway](demos/llm-gateway/).
+
+---
+
+## Ready-to-use Tools
+
+### harpctl
+
+`harpctl` is a small operations CLI for a running HARP proxy:
+
+```bash
+make build-tools
+./bin/harpctl health -addr http://localhost:8080
+./bin/harpctl ready -addr http://localhost:8080
+./bin/harpctl wait -addr http://localhost:8080 -timeout 30s
+./bin/harpctl metrics -addr http://localhost:9091
+```
+
+It uses the standard health endpoints (`/healthz`, `/readyz`, `/livez`) and
+the metrics endpoint without requiring shell-specific curl scripts.
+
+### Webhook Catcher
+
+The webhook catcher demo can be used as a small temporary receiver for GitHub,
+Stripe, Home Assistant, or custom webhook testing:
+
+```bash
+make run-demo-webhook-catcher
+curl -X POST http://localhost:8080/hooks/demo -d '{"hello":"world"}'
+curl http://localhost:8080/hooks/events
+```
 
 ---
 
@@ -445,10 +552,12 @@ Every proxied response includes an `X-Request-ID` header for end-to-end tracing.
 
 Set `enableAdminUI` to `true` to serve a lightweight dashboard at `adminPath`
 (default `/admin`). It shows current backend routes, request counters, cache
-state, and Go runtime scheduler metrics. Set `adminPassword` to require Basic
-Auth for both the HTML dashboard and `/admin/api/status`. Keep the UI disabled
-on public deployments unless the surrounding network or reverse proxy also
-restricts access.
+state, load-balancing strategy, Admin security posture, and Go runtime scheduler
+metrics. When enabled, Admin Basic Auth is required by default: set
+`adminPassword`, and optionally restrict access further with `adminAllowedCIDRs`.
+Use `adminInsecureSkipAuth: true` only for isolated local testing. Keep the UI
+disabled on public deployments unless the surrounding network or reverse proxy
+also restricts access.
 
 Run the admin demo:
 
