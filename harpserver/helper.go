@@ -9,7 +9,6 @@ import (
 	"context"
 	"log"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -198,7 +197,7 @@ func (h *RemoteHelper) handleRequest(
 	var hasRoute bool
 	var bestLen int
 	for path, route := range routeMap {
-		if strings.HasPrefix(req.URL.Path, path) && len(path) > bestLen {
+		if matchesRoutePrefix(req.URL.Path, path) && len(path) > bestLen {
 			matched = route
 			hasRoute = true
 			bestLen = len(path)

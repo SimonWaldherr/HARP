@@ -187,7 +187,7 @@ func (s *BackendServer) handleRequest(
 	if len(routeMap) > 0 {
 		var bestLen int
 		for path, candidate := range routeMap {
-			if strings.HasPrefix(req.URL.Path, path) && len(path) > bestLen {
+			if matchesRoutePrefix(req.URL.Path, path) && len(path) > bestLen {
 				route = candidate
 				bestLen = len(path)
 			}
@@ -231,6 +231,20 @@ func (s *BackendServer) handleRequest(
 	}); err != nil {
 		log.Printf("Error sending response: %v", err)
 	}
+}
+
+// matchesRoutePrefix reports whether requestPath belongs to a route prefix.
+// A route such as "/api" must match "/api" and "/api/users", but not
+// unrelated paths such as "/apix". Routes ending in a slash retain their
+// natural prefix semantics, and "/" matches every absolute request path.
+func matchesRoutePrefix(requestPath, routePath string) bool {
+	if routePath == "/" {
+		return strings.HasPrefix(requestPath, "/")
+	}
+	if !strings.HasPrefix(requestPath, routePath) {
+		return false
+	}
+	return strings.HasSuffix(routePath, "/") || len(requestPath) == len(routePath) || requestPath[len(routePath)] == '/'
 }
 
 func (s *BackendServer) handleStreamingRequest(

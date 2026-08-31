@@ -95,6 +95,7 @@ func TestRemoteHelperHandleRequest(t *testing.T) {
 		wantBody   string
 	}{
 		{"/api/users", 200, "api-response"},
+		{"/apix", 404, "no handler registered for /apix"},
 		{"/other", 201, "other"},
 		{"/unknown", 404, "no handler registered for /unknown"},
 	}
@@ -127,6 +128,30 @@ func TestRemoteHelperHandleRequest(t *testing.T) {
 			}
 			if resp.RequestId != reqProto.RequestId {
 				t.Errorf("path %s: RequestId mismatch: got %s, want %s", tc.path, resp.RequestId, reqProto.RequestId)
+			}
+		})
+	}
+}
+
+func TestMatchesRoutePrefix(t *testing.T) {
+	tests := []struct {
+		requestPath string
+		routePath   string
+		want        bool
+	}{
+		{"/", "/", true},
+		{"/api", "/api", true},
+		{"/api/users", "/api", true},
+		{"/apix", "/api", false},
+		{"/apiary/users", "/api", false},
+		{"/api/users", "/api/", true},
+		{"/api", "/api/", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.requestPath+"_"+tc.routePath, func(t *testing.T) {
+			if got := matchesRoutePrefix(tc.requestPath, tc.routePath); got != tc.want {
+				t.Errorf("matchesRoutePrefix(%q, %q) = %v, want %v", tc.requestPath, tc.routePath, got, tc.want)
 			}
 		})
 	}
