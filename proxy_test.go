@@ -4,12 +4,19 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"expvar"
+	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -110,6 +117,8 @@ func TestRateLimiter(t *testing.T) {
 	config.EnableRateLimit = true
 	t.Cleanup(func() { config.EnableRateLimit = origEnabled })
 	rl := NewRateLimiter(3)
+	now := time.Unix(1_000, 0)
+	rl.now = func() time.Time { return now }
 
 	ip := "127.0.0.1"
 	for i := 0; i < 3; i++ {
@@ -120,6 +129,14 @@ func TestRateLimiter(t *testing.T) {
 
 	if rl.Allow(ip) {
 		t.Error("4th request in same second should be rate limited")
+	}
+
+	now = now.Add(time.Second)
+	if !rl.Allow(ip) {
+		t.Error("request should be allowed once the oldest entry leaves the sliding window")
+	}
+	if got := rl.windowSize(ip); got != 3 {
+		t.Fatalf("rate window grew beyond configured limit: got %d, want 3", got)
 	}
 }
 
@@ -145,6 +162,62 @@ func TestRateLimiterZeroLimitAllowsRequests(t *testing.T) {
 	rl := NewRateLimiter(0)
 	if !rl.Allow("127.0.0.1") {
 		t.Fatal("zero rate limit should disable limiting")
+	}
+}
+
+func TestRateLimiterConcurrentClients(t *testing.T) {
+	originalEnabled := config.EnableRateLimit
+	config.EnableRateLimit = true
+	t.Cleanup(func() { config.EnableRateLimit = originalEnabled })
+
+	rl := NewRateLimiter(2)
+	fixedNow := time.Unix(1_000, 0)
+	rl.now = func() time.Time { return fixedNow }
+
+	const clients = 256
+	errors := make(chan string, clients)
+	var wg sync.WaitGroup
+	for i := 0; i < clients; i++ {
+		clientIP := "192.0.2." + strconv.Itoa(i)
+		wg.Go(func() {
+			if !rl.Allow(clientIP) || !rl.Allow(clientIP) || rl.Allow(clientIP) {
+				errors <- clientIP
+			}
+		})
+	}
+	wg.Wait()
+	close(errors)
+	for clientIP := range errors {
+		t.Errorf("unexpected concurrent rate-limit result for %s", clientIP)
+	}
+	if got := rl.trackedClients(); got != clients {
+		t.Fatalf("tracked clients = %d, want %d", got, clients)
+	}
+}
+
+func TestShardedStoreConcurrentAccess(t *testing.T) {
+	store := newShardedStore[int]()
+	const entries = 1_024
+	errors := make(chan string, entries)
+	var wg sync.WaitGroup
+	for i := 0; i < entries; i++ {
+		key := "request-" + strconv.Itoa(i)
+		value := i
+		wg.Go(func() {
+			store.Set(key, value)
+			if got, ok := store.Get(key); !ok || got != value {
+				errors <- key
+			}
+			store.Delete(key)
+			if _, ok := store.Get(key); ok {
+				errors <- key
+			}
+		})
+	}
+	wg.Wait()
+	close(errors)
+	for key := range errors {
+		t.Errorf("unexpected sharded store result for %s", key)
 	}
 }
 
@@ -232,33 +305,57 @@ func TestMemoryCacheEvictsExpiredFirst(t *testing.T) {
 	}
 }
 
+func TestDiskCacheAtomicSetGet(t *testing.T) {
+	originalTTL := config.CacheTTL
+	config.CacheTTL = "1m"
+	t.Cleanup(func() { config.CacheTTL = originalTTL })
+
+	dir := t.TempDir()
+	cache := NewDiskCache(dir)
+	want := &pb.HTTPResponse{Status: http.StatusOK, Body: "cached"}
+	cache.Set("key", want)
+
+	got, ok := cache.Get("key")
+	if !ok {
+		t.Fatal("expected disk cache hit")
+	}
+	if got.Status != want.Status || got.Body != want.Body {
+		t.Fatalf("unexpected cached response: %#v", got)
+	}
+	tempFiles, err := filepath.Glob(filepath.Join(dir, ".harp-cache-*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tempFiles) != 0 {
+		t.Fatalf("temporary cache files were not cleaned up: %#v", tempFiles)
+	}
+}
+
 func TestRateLimiterCleanup(t *testing.T) {
 	origEnabled := config.EnableRateLimit
 	config.EnableRateLimit = true
 	t.Cleanup(func() { config.EnableRateLimit = origEnabled })
 
 	rl := NewRateLimiter(100)
+	now := time.Unix(1_000, 0)
+	rl.now = func() time.Time { return now }
 
 	// Add some requests
 	rl.Allow("10.0.0.1")
 	rl.Allow("10.0.0.2")
 
-	rl.mu.Lock()
-	if len(rl.requests) != 2 {
-		t.Errorf("expected 2 IPs tracked, got %d", len(rl.requests))
+	if got := rl.trackedClients(); got != 2 {
+		t.Errorf("expected 2 IPs tracked, got %d", got)
 	}
-	rl.mu.Unlock()
 
-	// Wait for entries to expire
-	time.Sleep(1100 * time.Millisecond)
+	// Advance the injected clock so cleanup remains deterministic and fast.
+	now = now.Add(time.Second)
 
 	rl.Cleanup()
 
-	rl.mu.Lock()
-	if len(rl.requests) != 0 {
-		t.Errorf("expected 0 IPs after cleanup, got %d", len(rl.requests))
+	if got := rl.trackedClients(); got != 0 {
+		t.Errorf("expected 0 IPs after cleanup, got %d", got)
 	}
-	rl.mu.Unlock()
 }
 
 func TestGetCacheKeyDeterministic(t *testing.T) {
@@ -282,6 +379,64 @@ func TestGetCacheKeyDeterministic(t *testing.T) {
 	if cacheKeyA != cacheKeyB {
 		t.Errorf("header map insertion order should not affect cache key: %s != %s", cacheKeyA, cacheKeyB)
 	}
+}
+
+func TestGetCacheKeyIgnoresVolatileProxyHeaders(t *testing.T) {
+	base := map[string]string{
+		"Accept":            "application/json",
+		"X-Forwarded-Host":  "example.com",
+		"X-Forwarded-Proto": "https",
+	}
+	withRequestMetadata := map[string]string{
+		"accept":            "application/json",
+		"x-forwarded-host":  "example.com",
+		"x-forwarded-proto": "https",
+		"X-Forwarded-For":   "203.0.113.10",
+		"Forwarded":         `for="203.0.113.10";proto="https";host="example.com"`,
+		"Via":               "1.1 harp",
+		"X-Request-ID":      "unique-request-id",
+	}
+
+	if got, want := getCacheKey("GET", "/api", withRequestMetadata, ""), getCacheKey("GET", "/api", base, ""); got != want {
+		t.Fatalf("volatile proxy headers changed cache key: got %s, want %s", got, want)
+	}
+
+	differentHost := maps.Clone(base)
+	differentHost["X-Forwarded-Host"] = "other.example.com"
+	if getCacheKey("GET", "/api", differentHost, "") == getCacheKey("GET", "/api", base, "") {
+		t.Fatal("representation-affecting forwarded host must remain part of the cache key")
+	}
+}
+
+func BenchmarkGetCacheKey(b *testing.B) {
+	headers := map[string]string{
+		"Accept":            "application/json",
+		"Accept-Encoding":   "gzip, br",
+		"Authorization":     "Bearer token",
+		"X-Forwarded-Host":  "example.com",
+		"X-Forwarded-Proto": "https",
+		"X-Forwarded-For":   "203.0.113.10",
+		"X-Request-ID":      "request-id",
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = getCacheKey(http.MethodGet, "/api/items?page=1", headers, "")
+	}
+}
+
+func BenchmarkRateLimiterParallel(b *testing.B) {
+	originalEnabled := config.EnableRateLimit
+	config.EnableRateLimit = true
+	b.Cleanup(func() { config.EnableRateLimit = originalEnabled })
+	rl := NewRateLimiter(100)
+	var clientID atomic.Uint64
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		clientIP := "198.51.100." + strconv.FormatUint(clientID.Add(1), 10)
+		for pb.Next() {
+			rl.Allow(clientIP)
+		}
+	})
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
@@ -328,6 +483,71 @@ func TestLoadConfigDefaults(t *testing.T) {
 	// Restore config
 	config = origConfig
 	adminAllowedPrefixes = origAdminPrefixes
+}
+
+func TestNewConfiguredHTTPServerUsesConfiguredLimits(t *testing.T) {
+	original := config
+	t.Cleanup(func() { config = original })
+	config.ReadTimeout = "7s"
+	config.WriteTimeout = "11s"
+	config.IdleTimeout = "2m"
+	config.MaxHeaderSize = 16 << 10
+
+	server := newConfiguredHTTPServer(":8443", http.NotFoundHandler())
+	if server.ReadTimeout != 7*time.Second {
+		t.Fatalf("ReadTimeout = %s, want 7s", server.ReadTimeout)
+	}
+	if server.WriteTimeout != 11*time.Second {
+		t.Fatalf("WriteTimeout = %s, want 11s", server.WriteTimeout)
+	}
+	if server.IdleTimeout != 2*time.Minute {
+		t.Fatalf("IdleTimeout = %s, want 2m", server.IdleTimeout)
+	}
+	if server.MaxHeaderBytes != 16<<10 {
+		t.Fatalf("MaxHeaderBytes = %d, want %d", server.MaxHeaderBytes, 16<<10)
+	}
+}
+
+func TestShutdownRunningServersStopsHTTPServer(t *testing.T) {
+	servers.mu.Lock()
+	originalHTTP := servers.http
+	originalHTTP3 := servers.http3
+	originalGRPC := servers.grpc
+	servers.http = nil
+	servers.http3 = nil
+	servers.grpc = nil
+	servers.mu.Unlock()
+	originalShuttingDown := shuttingDown.Load()
+	t.Cleanup(func() {
+		servers.mu.Lock()
+		servers.http = originalHTTP
+		servers.http3 = originalHTTP3
+		servers.grpc = originalGRPC
+		servers.mu.Unlock()
+		shuttingDown.Store(originalShuttingDown)
+	})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.NotFoundHandler()}
+	registerHTTPServer(server)
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	shutdownRunningServers(ctx)
+
+	select {
+	case err := <-serveDone:
+		if !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("Serve returned %v, want http.ErrServerClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HTTP server did not stop during graceful shutdown")
+	}
 }
 
 func TestValidateConfigCollectsErrors(t *testing.T) {
@@ -1054,6 +1274,31 @@ func TestMatchBackendUsesHostAndPath(t *testing.T) {
 	if got != nil || route != "" {
 		t.Fatalf("expected no backend for unmatched host, got %#v route %q", got, route)
 	}
+
+	got, route, _ = matchBackend("example.com", "/apix")
+	if got != nil || route != "" {
+		t.Fatalf("expected route segment boundary to reject /apix, got %#v route %q", got, route)
+	}
+}
+
+func TestMatchesRegisteredRoute(t *testing.T) {
+	tests := []struct {
+		requestPath string
+		routePath   string
+		want        bool
+	}{
+		{"/", "/", true},
+		{"/api", "/api", true},
+		{"/api/users", "/api", true},
+		{"/apix", "/api", false},
+		{"/api/users", "/api/", true},
+		{"/api", "/api/", false},
+	}
+	for _, tc := range tests {
+		if got := matchesRegisteredRoute(tc.requestPath, tc.routePath); got != tc.want {
+			t.Errorf("matchesRegisteredRoute(%q, %q) = %v, want %v", tc.requestPath, tc.routePath, got, tc.want)
+		}
+	}
 }
 
 func TestMatchBackendRoundRobinWithinRoutePool(t *testing.T) {
@@ -1094,6 +1339,46 @@ func TestMatchBackendRoundRobinWithinRoutePool(t *testing.T) {
 	got, routePath, _ = matchBackend("example.com", "/api/users")
 	if got != first || routePath != "/api" {
 		t.Fatalf("third request should wrap to first backend, got %#v route %q", got, routePath)
+	}
+}
+
+func TestBackendIndexOrdersAndRemovesRoutes(t *testing.T) {
+	originalBackends := backends
+	originalIndex := backendIndex
+	backendsMu.Lock()
+	backends = make(map[string]*backendPool)
+	backendIndex = nil
+	backendsMu.Unlock()
+	t.Cleanup(func() {
+		backendsMu.Lock()
+		backends = originalBackends
+		backendIndex = originalIndex
+		backendsMu.Unlock()
+	})
+
+	shortRoute := registeredRoute{path: "/api", pattern: regexp.MustCompile(`example\.com/api`)}
+	longRoute := registeredRoute{path: "/api/admin", pattern: regexp.MustCompile(`example\.com/api/admin`)}
+	shortConn := &backendConn{routes: []registeredRoute{shortRoute}}
+	longConn := &backendConn{routes: []registeredRoute{longRoute}}
+	backendsMu.Lock()
+	addBackendToPool(backendKey(`example\.com`, shortRoute.path), shortRoute, shortConn)
+	addBackendToPool(backendKey(`example\.com`, longRoute.path), longRoute, longConn)
+	backendsMu.Unlock()
+
+	if got, route, _ := matchBackend("example.com", "/api/admin/users"); got != longConn || route != longRoute.path {
+		t.Fatalf("expected longest indexed route, got %#v route %q", got, route)
+	}
+	backendsMu.RLock()
+	if len(backendIndex) != 2 || backendIndex[0].route.path != longRoute.path {
+		t.Fatalf("backend index not ordered longest-first: %#v", backendIndex)
+	}
+	backendsMu.RUnlock()
+
+	backendsMu.Lock()
+	removeBackendFromPool(backendKey(`example\.com`, longRoute.path), longConn)
+	backendsMu.Unlock()
+	if got, route, _ := matchBackend("example.com", "/api/admin/users"); got != shortConn || route != shortRoute.path {
+		t.Fatalf("expected shorter route after removal, got %#v route %q", got, route)
 	}
 }
 

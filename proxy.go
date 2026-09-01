@@ -13,9 +13,9 @@ import (
 	"expvar"
 	"flag"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"log"
-	"maps"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -177,6 +177,7 @@ type MemoryCache struct {
 	mu       sync.RWMutex
 	items    map[string]cacheItem
 	maxItems int
+	ttl      time.Duration
 }
 
 type cacheItem struct {
@@ -192,6 +193,7 @@ func NewMemoryCache() *MemoryCache {
 	return &MemoryCache{
 		items:    make(map[string]cacheItem),
 		maxItems: maxItems,
+		ttl:      configuredCacheTTL(),
 	}
 }
 
@@ -242,9 +244,9 @@ func (mc *MemoryCache) Set(key string, resp *pb.HTTPResponse) {
 		}
 	}
 
-	ttl, err := time.ParseDuration(config.CacheTTL)
-	if err != nil {
-		ttl = 30 * time.Minute
+	ttl := mc.ttl
+	if ttl <= 0 {
+		ttl = configuredCacheTTL()
 	}
 	mc.items[key] = cacheItem{
 		resp:      resp,
@@ -272,13 +274,14 @@ func (mc *MemoryCache) Size() int {
 
 type DiskCache struct {
 	dir string
+	ttl time.Duration
 }
 
 func NewDiskCache(dir string) *DiskCache {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		logError("Error creating disk cache directory %s: %v", dir, err)
 	}
-	return &DiskCache{dir: dir}
+	return &DiskCache{dir: dir, ttl: configuredCacheTTL()}
 }
 
 func (dc *DiskCache) cacheFile(key string) string {
@@ -296,6 +299,7 @@ func (dc *DiskCache) Get(key string) (*pb.HTTPResponse, bool) {
 		ExpiresAt time.Time        `json:"expiresAt"`
 	}
 	if err := json.Unmarshal(data, &item); err != nil {
+		_ = os.Remove(filename)
 		return nil, false
 	}
 	if time.Now().After(item.ExpiresAt) {
@@ -306,26 +310,46 @@ func (dc *DiskCache) Get(key string) (*pb.HTTPResponse, bool) {
 }
 
 func (dc *DiskCache) Set(key string, resp *pb.HTTPResponse) {
-	ttl, err := time.ParseDuration(config.CacheTTL)
-	if err != nil {
-		ttl = 30 * time.Minute
-	}
 	item := struct {
 		Resp      *pb.HTTPResponse `json:"resp"`
 		ExpiresAt time.Time        `json:"expiresAt"`
 	}{
 		Resp:      resp,
-		ExpiresAt: time.Now().Add(ttl),
+		ExpiresAt: time.Now().Add(dc.ttl),
 	}
 	data, err := json.Marshal(item)
 	if err != nil {
 		logError("Error marshaling cache item: %v", err)
 		return
 	}
-	filename := dc.cacheFile(key)
-	if err := os.WriteFile(filename, data, 0644); err != nil {
-		logError("Error writing cache file: %v", err)
+	temp, err := os.CreateTemp(dc.dir, ".harp-cache-*.tmp")
+	if err != nil {
+		logError("Error creating temporary cache file: %v", err)
+		return
 	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		logError("Error writing temporary cache file: %v", err)
+		return
+	}
+	if err := temp.Close(); err != nil {
+		logError("Error closing temporary cache file: %v", err)
+		return
+	}
+	if err := os.Rename(tempName, dc.cacheFile(key)); err != nil {
+		logError("Error committing cache file: %v", err)
+	}
+}
+
+func configuredCacheTTL() time.Duration {
+	const defaultTTL = 30 * time.Minute
+	ttl, err := time.ParseDuration(config.CacheTTL)
+	if err != nil || ttl <= 0 {
+		return defaultTTL
+	}
+	return ttl
 }
 
 func (dc *DiskCache) Delete(key string) {
@@ -353,66 +377,127 @@ func (dc *DiskCache) Size() int {
 var cacheStore Cache
 
 // Rate limiter
+const rateLimiterShardCount = 64
+
 type RateLimiter struct {
+	shards  [rateLimiterShardCount]rateLimiterShard
+	limit   int
+	now     func() time.Time
+	seed    maphash.Seed
+	enabled bool
+}
+
+type rateLimiterShard struct {
 	mu       sync.Mutex
-	requests map[string][]time.Time
-	limit    int
+	requests map[string]*rateWindow
+}
+
+type rateWindow struct {
+	timestamps []time.Time
+	// next is the oldest timestamp and therefore the next slot replaced once
+	// the bounded window reaches the configured request limit.
+	next int
 }
 
 func NewRateLimiter(limit int) *RateLimiter {
-	return &RateLimiter{
-		requests: make(map[string][]time.Time),
-		limit:    limit,
+	rl := &RateLimiter{
+		limit:   limit,
+		now:     time.Now,
+		enabled: config.EnableRateLimit && limit > 0,
 	}
+	if !rl.enabled {
+		return rl
+	}
+	rl.seed = maphash.MakeSeed()
+	for i := range rl.shards {
+		rl.shards[i].requests = make(map[string]*rateWindow)
+	}
+	return rl
 }
 
 func (rl *RateLimiter) Allow(clientIP string) bool {
-	if !config.EnableRateLimit || rl.limit <= 0 {
+	if !rl.enabled {
 		return true
 	}
 
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+	now := rl.now()
+	shard := rl.shard(clientIP)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	now := time.Now()
-	requests := rl.requests[clientIP]
-
-	// Remove old requests (older than 1 second)
-	validRequests := requests[:0]
-	for _, t := range requests {
-		if now.Sub(t) < time.Second {
-			validRequests = append(validRequests, t)
-		}
+	window := shard.requests[clientIP]
+	if window == nil {
+		window = &rateWindow{timestamps: make([]time.Time, 0, min(rl.limit, 64))}
+		shard.requests[clientIP] = window
 	}
 
-	if len(validRequests) >= rl.limit {
+	if len(window.timestamps) < rl.limit {
+		window.timestamps = append(window.timestamps, now)
+		return true
+	}
+	if now.Sub(window.timestamps[window.next]) < time.Second {
 		return false
 	}
 
-	validRequests = append(validRequests, now)
-	rl.requests[clientIP] = validRequests
+	window.timestamps[window.next] = now
+	window.next = (window.next + 1) % rl.limit
 
 	return true
 }
 
 // Cleanup removes stale entries from the rate limiter to prevent memory leaks.
 func (rl *RateLimiter) Cleanup() {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	now := time.Now()
-	for ip, requests := range rl.requests {
-		valid := requests[:0]
-		for _, t := range requests {
-			if now.Sub(t) < time.Second {
-				valid = append(valid, t)
+	if !rl.enabled {
+		return
+	}
+	now := rl.now()
+	for i := range rl.shards {
+		shard := &rl.shards[i]
+		shard.mu.Lock()
+		for ip, window := range shard.requests {
+			if window == nil || len(window.timestamps) == 0 {
+				delete(shard.requests, ip)
+				continue
+			}
+			latest := len(window.timestamps) - 1
+			if len(window.timestamps) == rl.limit {
+				latest = (window.next + len(window.timestamps) - 1) % len(window.timestamps)
+			}
+			if now.Sub(window.timestamps[latest]) >= time.Second {
+				delete(shard.requests, ip)
 			}
 		}
-		if len(valid) == 0 {
-			delete(rl.requests, ip)
-		} else {
-			rl.requests[ip] = valid
-		}
+		shard.mu.Unlock()
 	}
+}
+
+func (rl *RateLimiter) shard(clientIP string) *rateLimiterShard {
+	index := maphash.String(rl.seed, clientIP) & (rateLimiterShardCount - 1)
+	return &rl.shards[index]
+}
+
+func (rl *RateLimiter) trackedClients() int {
+	total := 0
+	for i := range rl.shards {
+		shard := &rl.shards[i]
+		shard.mu.Lock()
+		total += len(shard.requests)
+		shard.mu.Unlock()
+	}
+	return total
+}
+
+func (rl *RateLimiter) windowSize(clientIP string) int {
+	if !rl.enabled {
+		return 0
+	}
+	shard := rl.shard(clientIP)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if window := shard.requests[clientIP]; window != nil {
+		return len(window.timestamps)
+	}
+	return 0
 }
 
 var rateLimiter *RateLimiter
@@ -422,14 +507,42 @@ func getCacheKey(method, url string, headers map[string]string, body string) str
 	h := sha256.New()
 	h.Write([]byte(method))
 	h.Write([]byte(url))
-	keys := slices.Sorted(maps.Keys(headers))
-	for _, k := range keys {
-		v := headers[k]
-		h.Write([]byte(k))
-		h.Write([]byte(v))
+	type cacheHeader struct {
+		name  string
+		value string
+	}
+	cacheHeaders := make([]cacheHeader, 0, len(headers))
+	for key, value := range headers {
+		normalizedKey := strings.ToLower(key)
+		if isVolatileCacheHeader(normalizedKey) {
+			continue
+		}
+		cacheHeaders = append(cacheHeaders, cacheHeader{name: normalizedKey, value: value})
+	}
+	slices.SortFunc(cacheHeaders, func(a, b cacheHeader) int {
+		if cmp := strings.Compare(a.name, b.name); cmp != 0 {
+			return cmp
+		}
+		return strings.Compare(a.value, b.value)
+	})
+	for _, header := range cacheHeaders {
+		h.Write([]byte(header.name))
+		h.Write([]byte(header.value))
 	}
 	h.Write([]byte(body))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// isVolatileCacheHeader identifies proxy-generated request metadata that does
+// not change the representation returned by a backend. Including these fields
+// would create a unique cache entry per request or client address.
+func isVolatileCacheHeader(name string) bool {
+	switch name {
+	case "forwarded", "via", "x-forwarded-for", "x-request-id":
+		return true
+	default:
+		return false
+	}
 }
 
 // --- Global registries for backends and pending responses ---
@@ -462,18 +575,73 @@ type routeSnapshot struct {
 	Backends  int    `json:"backends"`
 }
 
+const pendingStoreShardCount = 64
+
+type shardedStore[V any] struct {
+	shards [pendingStoreShardCount]shardedStoreShard[V]
+	seed   maphash.Seed
+}
+
+type shardedStoreShard[V any] struct {
+	mu    sync.RWMutex
+	items map[string]V
+}
+
+func newShardedStore[V any]() *shardedStore[V] {
+	store := &shardedStore[V]{seed: maphash.MakeSeed()}
+	for i := range store.shards {
+		store.shards[i].items = make(map[string]V)
+	}
+	return store
+}
+
+func (s *shardedStore[V]) Set(key string, value V) {
+	shard := s.shard(key)
+	shard.mu.Lock()
+	shard.items[key] = value
+	shard.mu.Unlock()
+}
+
+func (s *shardedStore[V]) Get(key string) (V, bool) {
+	shard := s.shard(key)
+	shard.mu.RLock()
+	value, ok := shard.items[key]
+	shard.mu.RUnlock()
+	return value, ok
+}
+
+func (s *shardedStore[V]) Delete(key string) {
+	shard := s.shard(key)
+	shard.mu.Lock()
+	delete(shard.items, key)
+	shard.mu.Unlock()
+}
+
+func (s *shardedStore[V]) shard(key string) *shardedStoreShard[V] {
+	index := maphash.String(s.seed, key) & (pendingStoreShardCount - 1)
+	return &s.shards[index]
+}
+
 var (
 	backendsMu sync.RWMutex
 	// Map route key to a pool of backend connections serving that route.
-	backends = make(map[string]*backendPool)
+	backends     = make(map[string]*backendPool)
+	backendIndex []*backendPool
 	// Pending responses keyed by request ID.
-	pendingMu       sync.RWMutex
-	pendingResponse = make(map[string]chan *pb.HTTPResponse)
-	pendingWSMu     sync.RWMutex
-	pendingWS       = make(map[string]*proxyWebSocketTunnel)
-	startTime       time.Time
-	requestSem      chan struct{}
+	pendingResponses  = newShardedStore[chan *pb.HTTPResponse]()
+	pendingWebSockets = newShardedStore[*proxyWebSocketTunnel]()
+	startTime         time.Time
+	requestSem        chan struct{}
+	servers           runningServerRegistry
+	shuttingDown      atomic.Bool
 )
+
+type runningServerRegistry struct {
+	mu    sync.Mutex
+	http  []*http.Server
+	http3 []*http3.Server
+	grpc  []*grpc.Server
+}
 
 const (
 	// Small burst buffer for streamed chunks to reduce head-of-line blocking
@@ -824,9 +992,7 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 				if wsData == nil {
 					continue
 				}
-				pendingWSMu.RLock()
-				tunnel, ok := pendingWS[wsData.RequestId]
-				pendingWSMu.RUnlock()
+				tunnel, ok := pendingWebSockets.Get(wsData.RequestId)
 				if ok {
 					deliverPendingWebSocket(stream.Context(), wsData, tunnel)
 				} else {
@@ -834,9 +1000,7 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 				}
 				continue
 			}
-			pendingMu.RLock()
-			ch, ok := pendingResponse[httpResp.RequestId]
-			pendingMu.RUnlock()
+			ch, ok := pendingResponses.Get(httpResp.RequestId)
 			if ok {
 				deliverPendingResponse(stream.Context(), httpResp, ch)
 			} else {
@@ -857,10 +1021,13 @@ func backendKey(domain, path string) string {
 func addBackendToPool(key string, route registeredRoute, conn *backendConn) {
 	pool, ok := backends[key]
 	if !ok {
-		backends[key] = &backendPool{
+		pool = &backendPool{
 			route: route,
 			conns: []*backendConn{conn},
 		}
+		backends[key] = pool
+		backendIndex = append(backendIndex, pool)
+		sortBackendIndex(backendIndex)
 		return
 	}
 	for _, existing := range pool.conns {
@@ -884,7 +1051,21 @@ func removeBackendFromPool(key string, conn *backendConn) {
 	}
 	if len(pool.conns) == 0 {
 		delete(backends, key)
+		for i, indexedPool := range backendIndex {
+			if indexedPool == pool {
+				copy(backendIndex[i:], backendIndex[i+1:])
+				backendIndex[len(backendIndex)-1] = nil
+				backendIndex = backendIndex[:len(backendIndex)-1]
+				break
+			}
+		}
 	}
+}
+
+func sortBackendIndex(pools []*backendPool) {
+	slices.SortStableFunc(pools, func(a, b *backendPool) int {
+		return len(b.route.path) - len(a.route.path)
+	})
 }
 
 func compileAllowedRegistrationRules(rules []AllowedRegistrationRule) ([]compiledAllowedRegistrationRule, error) {
@@ -978,10 +1159,11 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
+	metricRoute := "_unmatched"
 	defer func() {
 		duration := time.Since(start)
 		metrics.RequestsTotal.Add(1)
-		metrics.RequestDuration.Add(r.URL.Path, int64(duration/time.Millisecond))
+		metrics.RequestDuration.Add(metricRoute, int64(duration/time.Millisecond))
 	}()
 
 	// CORS handling
@@ -1012,6 +1194,7 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	chosen, matchedRoute, routeAuth := matchBackend(r.Host, r.URL.Path)
 
 	if matchedRoute != "" {
+		metricRoute = matchedRoute
 		metrics.RouteRequests.Add(matchedRoute, 1)
 	}
 
@@ -1067,8 +1250,10 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheKey := getCacheKey(r.Method, r.URL.String(), headers, bodyStr)
-	if config.EnableCache && strings.ToUpper(r.Method) == "GET" && config.CacheType != "none" {
+	cacheEnabled := config.EnableCache && cacheStore != nil && r.Method == http.MethodGet
+	var cacheKey string
+	if cacheEnabled {
+		cacheKey = getCacheKey(r.Method, r.URL.String(), headers, bodyStr)
 		if resp, ok := cacheStore.Get(cacheKey); ok {
 			logDebug("Cache hit for %s", r.URL.String())
 			metrics.CacheHits.Add(1)
@@ -1098,13 +1283,9 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Prepare channel for response.
 	respCh := make(chan *pb.HTTPResponse, responseChannelBufferSize)
-	pendingMu.Lock()
-	pendingResponse[reqID] = respCh
-	pendingMu.Unlock()
+	pendingResponses.Set(reqID, respCh)
 	defer func() {
-		pendingMu.Lock()
-		delete(pendingResponse, reqID)
-		pendingMu.Unlock()
+		pendingResponses.Delete(reqID)
 	}()
 
 	// Send the HTTPRequest to the chosen backend.
@@ -1116,19 +1297,15 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error forwarding request", http.StatusBadGateway)
 		logError("Error sending to backend: %v", err)
 		metrics.BackendErrors.Add(1)
-		pendingMu.Lock()
-		delete(pendingResponse, reqID)
-		pendingMu.Unlock()
 		return
 	}
 
-	// Wait for response with configurable timeout
-	timeout := 30 * time.Second
-	if config.RequestTimeout != "" {
-		if parsedTimeout, err := time.ParseDuration(config.RequestTimeout); err == nil {
-			timeout = parsedTimeout
-		}
-	}
+	// Wait for the response while releasing resources promptly when the client
+	// disconnects. Reuse one timer across streaming chunks to avoid retaining a
+	// new time.After timer for every chunk.
+	timeout := configuredRequestTimeout()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	flusher, canFlush := w.(http.Flusher)
 
 	select {
@@ -1164,7 +1341,7 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if !isStream || responseHeaderEnabled(resp, pb.StreamEndHeader) {
-				if config.EnableCache && strings.ToUpper(r.Method) == "GET" && config.CacheType != "none" && !isStream {
+				if cacheEnabled && !isStream {
 					cacheStore.Set(cacheKey, &pb.HTTPResponse{
 						Status:       int32(firstStatus),
 						Headers:      firstHeaders,
@@ -1176,18 +1353,45 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			resetTimer(timer, timeout)
 			select {
 			case resp = <-respCh:
-			case <-time.After(timeout):
+			case <-timer.C:
 				metrics.BackendErrors.Add(1)
 				logWarn("Stream timeout for request %s", reqID)
 				return
+			case <-r.Context().Done():
+				return
 			}
 		}
-	case <-time.After(timeout):
+	case <-timer.C:
 		http.Error(w, "Timeout waiting for backend", http.StatusGatewayTimeout)
 		metrics.BackendErrors.Add(1)
+	case <-r.Context().Done():
+		return
 	}
+}
+
+func configuredRequestTimeout() time.Duration {
+	const defaultTimeout = 30 * time.Second
+	if config.RequestTimeout == "" {
+		return defaultTimeout
+	}
+	timeout, err := time.ParseDuration(config.RequestTimeout)
+	if err != nil {
+		return defaultTimeout
+	}
+	return timeout
+}
+
+func resetTimer(timer *time.Timer, timeout time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(timeout)
 }
 
 type routeAuthConfig struct {
@@ -1196,34 +1400,44 @@ type routeAuthConfig struct {
 }
 
 func matchBackend(host, path string) (*backendConn, string, routeAuthConfig) {
-	var chosenPool *backendPool
-	var matchedRoute string
-	var auth routeAuthConfig
-	var bestLen int
 	requestRoute := routeTarget(host, path)
 
 	backendsMu.RLock()
 	defer backendsMu.RUnlock()
-	for _, pool := range backends {
-		route := pool.route
-		if route.pattern.MatchString(requestRoute) && len(route.path) > bestLen && len(pool.conns) > 0 {
-			chosenPool = pool
-			matchedRoute = route.path
-			auth = routeAuthConfig{
-				username: route.username,
-				password: route.password,
-			}
-			bestLen = len(route.path)
+	pools := backendIndex
+	// Tests and embedders may replace the legacy map directly. Reconstruct a
+	// local ordered view in that exceptional case; production updates maintain
+	// backendIndex incrementally during registration and disconnection.
+	if len(pools) != len(backends) {
+		pools = make([]*backendPool, 0, len(backends))
+		for _, pool := range backends {
+			pools = append(pools, pool)
 		}
+		sortBackendIndex(pools)
 	}
-	if chosenPool == nil {
-		return nil, "", routeAuthConfig{}
+	for _, pool := range pools {
+		route := pool.route
+		if len(pool.conns) == 0 || !matchesRegisteredRoute(path, route.path) || !route.pattern.MatchString(requestRoute) {
+			continue
+		}
+		auth := routeAuthConfig{username: route.username, password: route.password}
+		if config.LoadBalancingStrategy == loadBalancingFirst {
+			return pool.conns[0], route.path, auth
+		}
+		idx := atomic.AddUint64(&pool.next, 1) - 1
+		return pool.conns[int(idx%uint64(len(pool.conns)))], route.path, auth
 	}
-	if config.LoadBalancingStrategy == loadBalancingFirst {
-		return chosenPool.conns[0], matchedRoute, auth
+	return nil, "", routeAuthConfig{}
+}
+
+func matchesRegisteredRoute(requestPath, routePath string) bool {
+	if routePath == "/" {
+		return strings.HasPrefix(requestPath, "/")
 	}
-	idx := atomic.AddUint64(&chosenPool.next, 1) - 1
-	return chosenPool.conns[int(idx%uint64(len(chosenPool.conns)))], matchedRoute, auth
+	if !strings.HasPrefix(requestPath, routePath) {
+		return false
+	}
+	return strings.HasSuffix(routePath, "/") || len(requestPath) == len(routePath) || requestPath[len(routePath)] == '/'
 }
 
 func routeTarget(host, path string) string {
@@ -1590,12 +1804,15 @@ func startGRPCServer() {
 	}
 	grpcServer := grpc.NewServer(opts...)
 	pb.RegisterHarpServiceServer(grpcServer, &harpService{})
+	servers.mu.Lock()
+	servers.grpc = append(servers.grpc, grpcServer)
+	servers.mu.Unlock()
 	lis, err := net.Listen("tcp", config.GRPCPort)
 	if err != nil {
 		log.Fatalf("Failed to listen on %s: %v", config.GRPCPort, err)
 	}
 	logInfo("gRPC server listening on %s", config.GRPCPort)
-	if err := grpcServer.Serve(lis); err != nil {
+	if err := grpcServer.Serve(lis); err != nil && !shuttingDown.Load() {
 		log.Fatalf("gRPC server error: %v", err)
 	}
 }
@@ -1606,40 +1823,11 @@ func startHTTPServer() {
 	registerAdminHandlers(mux)
 	registerHealthHandlers(mux)
 
-	// Parse timeouts
-	readTimeout := 30 * time.Second
-	writeTimeout := 30 * time.Second
-	idleTimeout := 120 * time.Second
-
-	if config.ReadTimeout != "" {
-		if parsed, err := time.ParseDuration(config.ReadTimeout); err == nil {
-			readTimeout = parsed
-		}
-	}
-	if config.WriteTimeout != "" {
-		if parsed, err := time.ParseDuration(config.WriteTimeout); err == nil {
-			writeTimeout = parsed
-		}
-	}
-	if config.IdleTimeout != "" {
-		if parsed, err := time.ParseDuration(config.IdleTimeout); err == nil {
-			idleTimeout = parsed
-		}
-	}
-
-	server := &http.Server{
-		Addr:         config.HTTPPort,
-		Handler:      mux,
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
-		IdleTimeout:  idleTimeout,
-	}
-	if config.MaxHeaderSize > 0 {
-		server.MaxHeaderBytes = config.MaxHeaderSize
-	}
+	server := newConfiguredHTTPServer(config.HTTPPort, mux)
+	registerHTTPServer(server)
 
 	logInfo("HTTP server listening on %s", config.HTTPPort)
-	if err := server.ListenAndServe(); err != nil {
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) && !shuttingDown.Load() {
 		log.Fatalf("HTTP server error: %v", err)
 	}
 }
@@ -1653,19 +1841,38 @@ func startHTTPSServer() {
 	registerAdminHandlers(mux)
 	registerHealthHandlers(mux)
 
-	server := &http.Server{
-		Addr:         config.HTTPPort,
-		Handler:      mux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		TLSConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		},
-	}
+	server := newConfiguredHTTPServer(config.HTTPPort, mux)
+	server.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	registerHTTPServer(server)
 	logInfo("HTTPS server listening on %s", config.HTTPPort)
-	if err := server.ListenAndServeTLS(config.HTTPSCert, config.HTTPSKey); err != nil {
+	if err := server.ListenAndServeTLS(config.HTTPSCert, config.HTTPSKey); err != nil && !errors.Is(err, http.ErrServerClosed) && !shuttingDown.Load() {
 		log.Fatalf("HTTPS server error: %v", err)
 	}
+}
+
+func newConfiguredHTTPServer(addr string, handler http.Handler) *http.Server {
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  configuredDuration(config.ReadTimeout, 30*time.Second),
+		WriteTimeout: configuredDuration(config.WriteTimeout, 30*time.Second),
+		IdleTimeout:  configuredDuration(config.IdleTimeout, 120*time.Second),
+	}
+	if config.MaxHeaderSize > 0 {
+		server.MaxHeaderBytes = config.MaxHeaderSize
+	}
+	return server
+}
+
+func configuredDuration(value string, fallback time.Duration) time.Duration {
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func startHTTP3Server() {
@@ -1682,8 +1889,11 @@ func startHTTP3Server() {
 		Handler:   mux,
 		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13},
 	}
+	servers.mu.Lock()
+	servers.http3 = append(servers.http3, server)
+	servers.mu.Unlock()
 	logInfo("HTTP/3 server listening on %s", config.HTTP3Port)
-	if err := server.ListenAndServeTLS(config.HTTPSCert, config.HTTPSKey); err != nil {
+	if err := server.ListenAndServeTLS(config.HTTPSCert, config.HTTPSKey); err != nil && !shuttingDown.Load() {
 		log.Fatalf("HTTP/3 server error: %v", err)
 	}
 }
@@ -1711,11 +1921,59 @@ func startMetricsServer() {
 		Addr:    metricsPort,
 		Handler: mux,
 	}
+	registerHTTPServer(server)
 
 	logInfo("Metrics server listening on %s", metricsPort)
-	if err := server.ListenAndServe(); err != nil {
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) && !shuttingDown.Load() {
 		logError("Metrics server error: %v", err)
 	}
+}
+
+func registerHTTPServer(server *http.Server) {
+	servers.mu.Lock()
+	servers.http = append(servers.http, server)
+	servers.mu.Unlock()
+}
+
+func shutdownRunningServers(ctx context.Context) {
+	shuttingDown.Store(true)
+	servers.mu.Lock()
+	httpServers := append([]*http.Server(nil), servers.http...)
+	http3Servers := append([]*http3.Server(nil), servers.http3...)
+	grpcServers := append([]*grpc.Server(nil), servers.grpc...)
+	servers.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for _, server := range httpServers {
+		wg.Go(func() {
+			if err := server.Shutdown(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				logError("HTTP shutdown error: %v", err)
+			}
+		})
+	}
+	for _, server := range http3Servers {
+		wg.Go(func() {
+			if err := server.Shutdown(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				logError("HTTP/3 shutdown error: %v", err)
+			}
+		})
+	}
+	for _, server := range grpcServers {
+		wg.Go(func() {
+			done := make(chan struct{})
+			go func() {
+				server.GracefulStop()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				server.Stop()
+				<-done
+			}
+		})
+	}
+	wg.Wait()
 }
 
 func loadConfig(path string) {
@@ -1917,7 +2175,6 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownDelay)
 	defer cancel()
 
-	// Log shutdown completion
-	<-ctx.Done()
+	shutdownRunningServers(ctx)
 	logInfo("HARP proxy stopped")
 }

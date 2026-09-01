@@ -48,19 +48,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, chosen *backendConn
 		done: make(chan struct{}),
 	}
 
-	pendingMu.Lock()
-	pendingResponse[reqID] = respCh
-	pendingMu.Unlock()
-	pendingWSMu.Lock()
-	pendingWS[reqID] = wsTunnel
-	pendingWSMu.Unlock()
+	pendingResponses.Set(reqID, respCh)
+	pendingWebSockets.Set(reqID, wsTunnel)
 	defer func() {
-		pendingMu.Lock()
-		delete(pendingResponse, reqID)
-		pendingMu.Unlock()
-		pendingWSMu.Lock()
-		delete(pendingWS, reqID)
-		pendingWSMu.Unlock()
+		pendingResponses.Delete(reqID)
+		pendingWebSockets.Delete(reqID)
 		close(wsTunnel.done)
 	}()
 
@@ -83,12 +75,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, chosen *backendConn
 		return
 	}
 
-	timeout := 30 * time.Second
-	if config.RequestTimeout != "" {
-		if parsedTimeout, err := time.ParseDuration(config.RequestTimeout); err == nil {
-			timeout = parsedTimeout
-		}
-	}
+	timer := time.NewTimer(configuredRequestTimeout())
+	defer timer.Stop()
 
 	select {
 	case resp := <-respCh:
@@ -104,9 +92,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, chosen *backendConn
 		}
 		_ = conn.SetDeadline(time.Time{})
 		tunnelWebSocket(conn, rw, chosen, reqID, first, wsTunnel)
-	case <-time.After(timeout):
+	case <-timer.C:
 		http.Error(w, "Timeout waiting for WebSocket backend", http.StatusGatewayTimeout)
 		metrics.BackendErrors.Add(1)
+		_ = sendWebSocketClose(chosen, reqID)
+	case <-r.Context().Done():
 		_ = sendWebSocketClose(chosen, reqID)
 	}
 }

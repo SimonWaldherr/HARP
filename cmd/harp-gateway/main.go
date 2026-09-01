@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -115,24 +116,9 @@ func main() {
 		ReconnectInterval: reconnect,
 	}
 
-	maxIdleConns := cfg.UpstreamMaxIdleConns
-	if maxIdleConns <= 0 {
-		maxIdleConns = 200
-	}
-	maxIdleConnsPerHost := cfg.UpstreamMaxIdleConnsPerHost
-	if maxIdleConnsPerHost <= 0 {
-		maxIdleConnsPerHost = 100
-	}
-
 	// Create an HTTP client with concurrency-friendly defaults for local upstreams.
 	httpClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
-			MaxIdleConns:        maxIdleConns,
-			MaxIdleConnsPerHost: maxIdleConnsPerHost,
-			MaxConnsPerHost:     cfg.UpstreamMaxConnsPerHost,
-			IdleConnTimeout:     90 * time.Second,
-		},
+		Transport: newUpstreamTransport(cfg),
 	}
 
 	for _, svc := range cfg.Services {
@@ -226,6 +212,32 @@ func main() {
 	log.Fatal(helper.ListenAndServe())
 }
 
+func newUpstreamTransport(cfg GatewayConfig) *http.Transport {
+	maxIdleConns := cfg.UpstreamMaxIdleConns
+	if maxIdleConns <= 0 {
+		maxIdleConns = 200
+	}
+	maxIdleConnsPerHost := cfg.UpstreamMaxIdleConnsPerHost
+	if maxIdleConnsPerHost <= 0 {
+		maxIdleConnsPerHost = 100
+	}
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	return &http.Transport{
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		MaxIdleConns:          maxIdleConns,
+		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+		MaxConnsPerHost:       cfg.UpstreamMaxConnsPerHost,
+		IdleConnTimeout:       90 * time.Second,
+	}
+}
+
 func buildUpstreamRequest(r *http.Request, svc ServiceConfig) (*http.Request, error) {
 	path := r.URL.Path
 	if svc.StripPrefix {
@@ -243,7 +255,7 @@ func buildUpstreamRequest(r *http.Request, svc ServiceConfig) (*http.Request, er
 	if r.Body != nil {
 		body = r.Body
 	}
-	upReq, err := http.NewRequest(r.Method, upstreamURL, body)
+	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, body)
 	if err != nil {
 		return nil, err
 	}
