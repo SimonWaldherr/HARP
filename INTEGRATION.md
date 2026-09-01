@@ -272,8 +272,8 @@ Use `header_values` when a header can appear more than once, for example
 `Set-Cookie`. Use `body_bytes` for binary payloads or any body that is not
 guaranteed to be UTF-8.
 
-The connection is persistent. Reconnect and re-send the Registration message
-whenever the stream drops.
+The connection is persistent. Reconnect with jittered exponential backoff and
+re-send the Registration message whenever the stream drops.
 
 ---
 

@@ -27,6 +27,7 @@ import (
 	"runtime"
 	runtimemetrics "runtime/metrics"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,6 +58,7 @@ type Config struct {
 	CacheType             string                    `json:"cacheType"`
 	DiskCacheDir          string                    `json:"diskCacheDir"`
 	CacheTTL              string                    `json:"cacheTTL"`
+	CacheMaxItems         int                       `json:"cacheMaxItems"`
 	AllowedRegistration   []AllowedRegistrationRule `json:"allowedRegistration"`
 	LogLevel              string                    `json:"logLevel"`
 	LoadBalancingStrategy string                    `json:"loadBalancingStrategy"`
@@ -114,7 +116,16 @@ type Metrics struct {
 	BackendsRegistered *expvar.Int
 	RouteRequests      *expvar.Map
 	RateLimited        *expvar.Int
+	routeMetrics       sync.Map
+	unmatched          *routeMetrics
 }
+
+type routeMetrics struct {
+	requests       [routeMetricShardCount]atomic.Int64
+	durationMillis [routeMetricShardCount]atomic.Int64
+}
+
+const routeMetricShardCount = 64
 
 var (
 	config                   Config
@@ -152,6 +163,50 @@ func initMetrics() {
 		RouteRequests:      expvar.NewMap("route_requests_total"),
 		RateLimited:        expvar.NewInt("rate_limited_total"),
 	}
+	metrics.unmatched = metrics.routeMetricsFor("_unmatched")
+}
+
+func (m *Metrics) routeMetricsFor(route string) *routeMetrics {
+	if existing, ok := m.routeMetrics.Load(route); ok {
+		return existing.(*routeMetrics)
+	}
+	candidate := new(routeMetrics)
+	actual, loaded := m.routeMetrics.LoadOrStore(route, candidate)
+	if loaded {
+		return actual.(*routeMetrics)
+	}
+	m.RouteRequests.Set(route, expvar.Func(func() any { return candidate.requestCount() }))
+	m.RequestDuration.Set(route, expvar.Func(func() any { return candidate.durationMillisTotal() }))
+	return candidate
+}
+
+func (m *Metrics) unmatchedRouteMetrics() *routeMetrics {
+	if m.unmatched != nil {
+		return m.unmatched
+	}
+	return m.routeMetricsFor("_unmatched")
+}
+
+func (m *routeMetrics) add(shard uint64, duration time.Duration) {
+	index := shard & (routeMetricShardCount - 1)
+	m.requests[index].Add(1)
+	m.durationMillis[index].Add(int64(duration / time.Millisecond))
+}
+
+func (m *routeMetrics) requestCount() int64 {
+	var total int64
+	for i := range m.requests {
+		total += m.requests[i].Load()
+	}
+	return total
+}
+
+func (m *routeMetrics) durationMillisTotal() int64 {
+	var total int64
+	for i := range m.durationMillis {
+		total += m.durationMillis[i].Load()
+	}
+	return total
 }
 
 // Logging helpers.
@@ -187,8 +242,8 @@ type cacheItem struct {
 
 func NewMemoryCache() *MemoryCache {
 	maxItems := 1000 // Default max items
-	if config.ConnectionPoolSize > 0 {
-		maxItems = config.ConnectionPoolSize * 10
+	if config.CacheMaxItems > 0 {
+		maxItems = config.CacheMaxItems
 	}
 	return &MemoryCache{
 		items:    make(map[string]cacheItem),
@@ -382,7 +437,7 @@ const rateLimiterShardCount = 64
 type RateLimiter struct {
 	shards  [rateLimiterShardCount]rateLimiterShard
 	limit   int
-	now     func() time.Time
+	now     func() time.Duration
 	seed    maphash.Seed
 	enabled bool
 }
@@ -393,16 +448,17 @@ type rateLimiterShard struct {
 }
 
 type rateWindow struct {
-	timestamps []time.Time
+	timestamps []time.Duration
 	// next is the oldest timestamp and therefore the next slot replaced once
 	// the bounded window reaches the configured request limit.
 	next int
 }
 
 func NewRateLimiter(limit int) *RateLimiter {
+	started := time.Now()
 	rl := &RateLimiter{
 		limit:   limit,
-		now:     time.Now,
+		now:     func() time.Duration { return time.Since(started) },
 		enabled: config.EnableRateLimit && limit > 0,
 	}
 	if !rl.enabled {
@@ -427,7 +483,7 @@ func (rl *RateLimiter) Allow(clientIP string) bool {
 
 	window := shard.requests[clientIP]
 	if window == nil {
-		window = &rateWindow{timestamps: make([]time.Time, 0, min(rl.limit, 64))}
+		window = &rateWindow{timestamps: make([]time.Duration, 0, min(rl.limit, 64))}
 		shard.requests[clientIP] = window
 	}
 
@@ -435,7 +491,7 @@ func (rl *RateLimiter) Allow(clientIP string) bool {
 		window.timestamps = append(window.timestamps, now)
 		return true
 	}
-	if now.Sub(window.timestamps[window.next]) < time.Second {
+	if now-window.timestamps[window.next] < time.Second {
 		return false
 	}
 
@@ -463,7 +519,7 @@ func (rl *RateLimiter) Cleanup() {
 			if len(window.timestamps) == rl.limit {
 				latest = (window.next + len(window.timestamps) - 1) % len(window.timestamps)
 			}
-			if now.Sub(window.timestamps[latest]) >= time.Second {
+			if now-window.timestamps[latest] >= time.Second {
 				delete(shard.requests, ip)
 			}
 		}
@@ -502,47 +558,152 @@ func (rl *RateLimiter) windowSize(clientIP string) int {
 
 var rateLimiter *RateLimiter
 
+var errRequestBodyTooLarge = errors.New("request body too large")
+
+func readRequestBody(r *http.Request, maxSize int64) ([]byte, error) {
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil, nil
+	}
+	defer r.Body.Close()
+	if maxSize > 0 && r.ContentLength > maxSize {
+		return nil, errRequestBodyTooLarge
+	}
+	maxInt := int64(^uint(0) >> 1)
+	if r.ContentLength > 0 && r.ContentLength <= maxInt {
+		body := make([]byte, int(r.ContentLength))
+		n, err := io.ReadFull(r.Body, body)
+		if err == nil {
+			return body, nil
+		}
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return body[:n], nil
+		}
+		return nil, err
+	}
+
+	var reader io.Reader = r.Body
+	if maxSize > 0 {
+		reader = io.LimitReader(r.Body, maxSize+1)
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	if maxSize > 0 && int64(len(body)) > maxSize {
+		return nil, errRequestBodyTooLarge
+	}
+	return body, nil
+}
+
+func cacheLookupMethod(method string) (string, bool) {
+	if method == http.MethodGet || method == http.MethodHead {
+		return http.MethodGet, true
+	}
+	return "", false
+}
+
+func responseBodyAllowed(method string, status int) bool {
+	if method == http.MethodHead {
+		return false
+	}
+	return status >= 200 && status != http.StatusNoContent && status != http.StatusNotModified
+}
+
+func writeCachedResponse(w http.ResponseWriter, method string, resp *pb.HTTPResponse) {
+	status := int(resp.Status)
+	respHeaders := filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues))
+	appendVia(respHeaders)
+	copyHTTPHeaders(w.Header(), respHeaders)
+	respBody := pb.BodyBytesFromProto(resp.Body, resp.BodyBytes)
+	if method == http.MethodHead && respHeaders.Get("Content-Length") == "" && responseBodyAllowed(http.MethodGet, status) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
+	}
+	w.WriteHeader(status)
+	if responseBodyAllowed(method, status) && len(respBody) > 0 {
+		_, _ = w.Write(respBody)
+	}
+}
+
 // getCacheKey computes a key for caching.
 func getCacheKey(method, url string, headers map[string]string, body string) string {
-	h := sha256.New()
-	h.Write([]byte(method))
-	h.Write([]byte(url))
 	type cacheHeader struct {
 		name  string
 		value string
 	}
-	cacheHeaders := make([]cacheHeader, 0, len(headers))
+	var headerStorage [16]cacheHeader
+	cacheHeaders := headerStorage[:0]
 	for key, value := range headers {
-		normalizedKey := strings.ToLower(key)
-		if isVolatileCacheHeader(normalizedKey) {
+		if isVolatileCacheHeader(key) {
 			continue
 		}
-		cacheHeaders = append(cacheHeaders, cacheHeader{name: normalizedKey, value: value})
+		cacheHeaders = append(cacheHeaders, cacheHeader{name: key, value: value})
 	}
 	slices.SortFunc(cacheHeaders, func(a, b cacheHeader) int {
-		if cmp := strings.Compare(a.name, b.name); cmp != 0 {
+		if cmp := compareASCIIFold(a.name, b.name); cmp != 0 {
 			return cmp
 		}
 		return strings.Compare(a.value, b.value)
 	})
+
+	var inputStorage [1024]byte
+	input := inputStorage[:0]
+	input = append(input, method...)
+	input = append(input, 0)
+	input = append(input, url...)
+	input = append(input, 0)
 	for _, header := range cacheHeaders {
-		h.Write([]byte(header.name))
-		h.Write([]byte(header.value))
+		for i := range header.name {
+			input = append(input, lowerASCII(header.name[i]))
+		}
+		input = append(input, 0)
+		input = append(input, header.value...)
+		input = append(input, 0)
 	}
-	h.Write([]byte(body))
-	return hex.EncodeToString(h.Sum(nil))
+	input = append(input, body...)
+	sum := sha256.Sum256(input)
+	var encoded [sha256.Size * 2]byte
+	hex.Encode(encoded[:], sum[:])
+	return string(encoded[:])
 }
 
 // isVolatileCacheHeader identifies proxy-generated request metadata that does
 // not change the representation returned by a backend. Including these fields
 // would create a unique cache entry per request or client address.
 func isVolatileCacheHeader(name string) bool {
-	switch name {
-	case "forwarded", "via", "x-forwarded-for", "x-request-id":
-		return true
+	switch len(name) {
+	case len("Via"):
+		return strings.EqualFold(name, "Via")
+	case len("Forwarded"):
+		return strings.EqualFold(name, "Forwarded")
+	case len("X-Request-ID"):
+		return strings.EqualFold(name, "X-Request-ID")
+	case len("X-Forwarded-For"):
+		return strings.EqualFold(name, "X-Forwarded-For")
 	default:
 		return false
 	}
+}
+
+func compareASCIIFold(a, b string) int {
+	length := min(len(a), len(b))
+	for i := 0; i < length; i++ {
+		ac := lowerASCII(a[i])
+		bc := lowerASCII(b[i])
+		if ac < bc {
+			return -1
+		}
+		if ac > bc {
+			return 1
+		}
+	}
+	return len(a) - len(b)
+}
+
+func lowerASCII(char byte) byte {
+	if char >= 'A' && char <= 'Z' {
+		return char + ('a' - 'A')
+	}
+	return char
 }
 
 // --- Global registries for backends and pending responses ---
@@ -550,6 +711,7 @@ type backendConn struct {
 	stream pb.HarpService_ProxyServer
 	routes []registeredRoute
 	mu     sync.Mutex // protects stream writes
+	failed atomic.Bool
 }
 
 type backendPool struct {
@@ -559,12 +721,14 @@ type backendPool struct {
 }
 
 type registeredRoute struct {
-	name     string
-	pattern  *regexp.Regexp
-	domain   string
-	path     string
-	username string
-	password string
+	name          string
+	pattern       *regexp.Regexp // legacy combined domain+path pattern
+	domainPattern *regexp.Regexp
+	domain        string
+	path          string
+	username      string
+	password      string
+	metrics       *routeMetrics
 }
 
 type routeSnapshot struct {
@@ -573,6 +737,81 @@ type routeSnapshot struct {
 	Path      string `json:"path"`
 	Protected bool   `json:"protected"`
 	Backends  int    `json:"backends"`
+}
+
+type cachedRouteSnapshot struct {
+	generation uint64
+	routes     []routeSnapshot
+}
+
+type memoryStatsSnapshot struct {
+	Alloc      uint64 `json:"alloc"`
+	TotalAlloc uint64 `json:"total_alloc"`
+	Sys        uint64 `json:"sys"`
+	NumGC      uint32 `json:"num_gc"`
+}
+
+type monitoringRuntimeSnapshot struct {
+	captured  time.Time
+	memory    memoryStatsSnapshot
+	scheduler map[string]uint64
+}
+
+type metricsResponse struct {
+	RequestsTotal      int64               `json:"requests_total"`
+	CacheHits          int64               `json:"cache_hits"`
+	CacheMisses        int64               `json:"cache_misses"`
+	BackendErrors      int64               `json:"backend_errors"`
+	ActiveConnections  int64               `json:"active_connections"`
+	BackendsRegistered int64               `json:"backends_registered"`
+	RateLimited        int64               `json:"rate_limited"`
+	MemoryStats        memoryStatsSnapshot `json:"memory_stats"`
+	RuntimeScheduler   map[string]uint64   `json:"runtime_scheduler"`
+	RouteRequests      map[string]int64    `json:"route_requests"`
+	RequestDurationMS  map[string]int64    `json:"request_duration_ms"`
+	CacheStats         *cacheStatsSnapshot `json:"cache_stats,omitempty"`
+}
+
+type cacheStatsSnapshot struct {
+	Size int `json:"size"`
+}
+
+type adminProxySnapshot struct {
+	GRPCPort              string `json:"grpcPort"`
+	HTTPPort              string `json:"httpPort"`
+	CacheEnabled          bool   `json:"cacheEnabled"`
+	CacheType             string `json:"cacheType"`
+	RateLimit             bool   `json:"rateLimit"`
+	MaxConcurrent         int    `json:"maxConcurrent"`
+	LoadBalancingStrategy string `json:"loadBalancingStrategy"`
+}
+
+type adminSecuritySnapshot struct {
+	Path              string   `json:"path"`
+	AuthRequired      bool     `json:"authRequired"`
+	NetworkRestricted bool     `json:"networkRestricted"`
+	AllowedCIDRs      []string `json:"allowedCIDRs"`
+}
+
+type adminCounterSnapshot struct {
+	RequestsTotal      int64 `json:"requestsTotal"`
+	CacheHits          int64 `json:"cacheHits"`
+	CacheMisses        int64 `json:"cacheMisses"`
+	BackendErrors      int64 `json:"backendErrors"`
+	ActiveConnections  int64 `json:"activeConnections"`
+	BackendsRegistered int64 `json:"backendsRegistered"`
+	RateLimited        int64 `json:"rateLimited"`
+	CacheSize          int   `json:"cacheSize"`
+}
+
+type adminStatusResponse struct {
+	Status           string                `json:"status"`
+	Uptime           float64               `json:"uptime"`
+	Proxy            adminProxySnapshot    `json:"proxy"`
+	Admin            adminSecuritySnapshot `json:"admin"`
+	Routes           []routeSnapshot       `json:"routes"`
+	Counters         adminCounterSnapshot  `json:"counters"`
+	RuntimeScheduler map[string]uint64     `json:"runtimeScheduler"`
 }
 
 const pendingStoreShardCount = 64
@@ -625,16 +864,30 @@ func (s *shardedStore[V]) shard(key string) *shardedStoreShard[V] {
 var (
 	backendsMu sync.RWMutex
 	// Map route key to a pool of backend connections serving that route.
-	backends     = make(map[string]*backendPool)
-	backendIndex []*backendPool
+	backends            = make(map[string]*backendPool)
+	backendIndex        []*backendPool
+	backendPathIndex    = make(map[string][]*backendPool)
+	backendIndexedPools int
 	// Pending responses keyed by request ID.
-	pendingResponses  = newShardedStore[chan *pb.HTTPResponse]()
-	pendingWebSockets = newShardedStore[*proxyWebSocketTunnel]()
-	startTime         time.Time
-	requestSem        chan struct{}
-	servers           runningServerRegistry
-	shuttingDown      atomic.Bool
+	pendingResponses        = newShardedStore[chan *pb.HTTPResponse]()
+	pendingWebSockets       = newShardedStore[*proxyWebSocketTunnel]()
+	startTime               time.Time
+	requestSem              chan struct{}
+	servers                 runningServerRegistry
+	shuttingDown            atomic.Bool
+	routeSnapshotGeneration atomic.Uint64
+	routeSnapshotCache      atomic.Pointer[cachedRouteSnapshot]
+	runtimeSnapshotCache    atomic.Pointer[monitoringRuntimeSnapshot]
+	runtimeSnapshotMu       sync.Mutex
+	adminPageCache          atomic.Pointer[cachedAdminPage]
 )
+
+type cachedAdminPage struct {
+	path string
+	html string
+}
+
+const runtimeSnapshotTTL = time.Second
 
 type runningServerRegistry struct {
 	mu    sync.Mutex
@@ -710,9 +963,14 @@ func registerHealthHandlers(mux *http.ServeMux) {
 }
 
 func registeredRoutesSnapshot() []routeSnapshot {
-	backendsMu.RLock()
-	defer backendsMu.RUnlock()
+	generation := routeSnapshotGeneration.Load()
+	if cached := routeSnapshotCache.Load(); cached != nil && cached.generation == generation {
+		return cached.routes
+	}
 
+	backendsMu.RLock()
+	cacheable := backendIndexedPools == len(backends)
+	generation = routeSnapshotGeneration.Load()
 	routes := make([]routeSnapshot, 0, len(backends))
 	for _, pool := range backends {
 		route := pool.route
@@ -724,92 +982,107 @@ func registeredRoutesSnapshot() []routeSnapshot {
 			Backends:  len(pool.conns),
 		})
 	}
+	backendsMu.RUnlock()
 	slices.SortFunc(routes, func(a, b routeSnapshot) int {
 		if cmp := strings.Compare(a.Domain, b.Domain); cmp != 0 {
 			return cmp
 		}
 		return strings.Compare(a.Path, b.Path)
 	})
+	if cacheable {
+		routeSnapshotCache.Store(&cachedRouteSnapshot{generation: generation, routes: routes})
+	}
 	return routes
 }
 
 // Metrics endpoint
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-
-	stats := map[string]interface{}{
-		"requests_total":      metrics.RequestsTotal.Value(),
-		"cache_hits":          metrics.CacheHits.Value(),
-		"cache_misses":        metrics.CacheMisses.Value(),
-		"backend_errors":      metrics.BackendErrors.Value(),
-		"active_connections":  metrics.ActiveConnections.Value(),
-		"backends_registered": metrics.BackendsRegistered.Value(),
-		"rate_limited":        metrics.RateLimited.Value(),
-		"memory_stats": map[string]interface{}{
-			"alloc":       memStats.Alloc,
-			"total_alloc": memStats.TotalAlloc,
-			"sys":         memStats.Sys,
-			"num_gc":      memStats.NumGC,
-		},
-		"runtime_scheduler": runtimeMetricSnapshot(schedulerMetricNames),
+	w.Header().Set("Cache-Control", "no-store")
+	runtimeStats := currentMonitoringRuntimeSnapshot()
+	stats := metricsResponse{
+		RequestsTotal:      metrics.RequestsTotal.Value(),
+		CacheHits:          metrics.CacheHits.Value(),
+		CacheMisses:        metrics.CacheMisses.Value(),
+		BackendErrors:      metrics.BackendErrors.Value(),
+		ActiveConnections:  metrics.ActiveConnections.Value(),
+		BackendsRegistered: metrics.BackendsRegistered.Value(),
+		RateLimited:        metrics.RateLimited.Value(),
+		MemoryStats:        runtimeStats.memory,
+		RuntimeScheduler:   runtimeStats.scheduler,
+		RouteRequests:      expvarIntMapSnapshot(metrics.RouteRequests),
+		RequestDurationMS:  expvarIntMapSnapshot(metrics.RequestDuration),
 	}
 
 	if cacheStore != nil {
-		stats["cache_stats"] = map[string]interface{}{
-			"size": cacheStore.Size(),
-		}
+		stats.CacheStats = &cacheStatsSnapshot{Size: cacheStore.Size()}
 	}
 
-	json.NewEncoder(w).Encode(stats)
+	if r.Method == http.MethodGet {
+		if err := json.NewEncoder(w).Encode(stats); err != nil {
+			logError("Error writing metrics response: %v", err)
+		}
+	}
 }
 
 func adminStatusHandler(w http.ResponseWriter, r *http.Request) {
 	if !requireAdminAccess(w, r) {
 		return
 	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 
 	var cacheSize int
 	if cacheStore != nil {
 		cacheSize = cacheStore.Size()
 	}
 
-	resp := map[string]interface{}{
-		"status": "healthy",
-		"uptime": time.Since(startTime).Seconds(),
-		"proxy": map[string]interface{}{
-			"grpcPort":              config.GRPCPort,
-			"httpPort":              config.HTTPPort,
-			"cacheEnabled":          config.EnableCache,
-			"cacheType":             config.CacheType,
-			"rateLimit":             config.EnableRateLimit,
-			"maxConcurrent":         config.MaxConcurrentRequests,
-			"loadBalancingStrategy": config.LoadBalancingStrategy,
+	runtimeStats := currentMonitoringRuntimeSnapshot()
+	resp := adminStatusResponse{
+		Status: "healthy",
+		Uptime: time.Since(startTime).Seconds(),
+		Proxy: adminProxySnapshot{
+			GRPCPort:              config.GRPCPort,
+			HTTPPort:              config.HTTPPort,
+			CacheEnabled:          config.EnableCache,
+			CacheType:             config.CacheType,
+			RateLimit:             config.EnableRateLimit,
+			MaxConcurrent:         config.MaxConcurrentRequests,
+			LoadBalancingStrategy: config.LoadBalancingStrategy,
 		},
-		"admin": map[string]interface{}{
-			"path":              adminPath(),
-			"authRequired":      !config.AdminInsecureSkipAuth,
-			"networkRestricted": len(adminAllowedPrefixes) > 0,
-			"allowedCIDRs":      append([]string(nil), config.AdminAllowedCIDRs...),
+		Admin: adminSecuritySnapshot{
+			Path:              adminPath(),
+			AuthRequired:      !config.AdminInsecureSkipAuth,
+			NetworkRestricted: len(adminAllowedPrefixes) > 0,
+			AllowedCIDRs:      config.AdminAllowedCIDRs,
 		},
-		"routes": registeredRoutesSnapshot(),
-		"counters": map[string]interface{}{
-			"requestsTotal":      metrics.RequestsTotal.Value(),
-			"cacheHits":          metrics.CacheHits.Value(),
-			"cacheMisses":        metrics.CacheMisses.Value(),
-			"backendErrors":      metrics.BackendErrors.Value(),
-			"activeConnections":  metrics.ActiveConnections.Value(),
-			"backendsRegistered": metrics.BackendsRegistered.Value(),
-			"rateLimited":        metrics.RateLimited.Value(),
-			"cacheSize":          cacheSize,
+		Routes: registeredRoutesSnapshot(),
+		Counters: adminCounterSnapshot{
+			RequestsTotal:      metrics.RequestsTotal.Value(),
+			CacheHits:          metrics.CacheHits.Value(),
+			CacheMisses:        metrics.CacheMisses.Value(),
+			BackendErrors:      metrics.BackendErrors.Value(),
+			ActiveConnections:  metrics.ActiveConnections.Value(),
+			BackendsRegistered: metrics.BackendsRegistered.Value(),
+			RateLimited:        metrics.RateLimited.Value(),
+			CacheSize:          cacheSize,
 		},
-		"runtimeScheduler": runtimeMetricSnapshot(schedulerMetricNames),
+		RuntimeScheduler: runtimeStats.scheduler,
 	}
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		logError("Error writing admin status: %v", err)
+	if r.Method == http.MethodGet {
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			logError("Error writing admin status: %v", err)
+		}
 	}
 }
 
@@ -817,8 +1090,24 @@ func adminUIHandler(w http.ResponseWriter, r *http.Request) {
 	if !requireAdminAccess(w, r) {
 		return
 	}
+	path := adminPath()
+	if r.URL.Path != path && r.URL.Path != path+"/" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, adminHTML(adminPath()))
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if r.Method == http.MethodGet {
+		_, _ = io.WriteString(w, adminHTML(path))
+	}
 }
 
 func requireAdminAccess(w http.ResponseWriter, r *http.Request) bool {
@@ -854,7 +1143,12 @@ func adminClientAllowed(r *http.Request) bool {
 }
 
 func adminHTML(path string) string {
-	return strings.ReplaceAll(adminHTMLTemplate, "__ADMIN_API__", path+"/api/status")
+	if cached := adminPageCache.Load(); cached != nil && cached.path == path {
+		return cached.html
+	}
+	page := strings.ReplaceAll(adminHTMLTemplate, "__ADMIN_API__", path+"/api/status")
+	adminPageCache.Store(&cachedAdminPage{path: path, html: page})
+	return page
 }
 
 func adminPath() string {
@@ -908,6 +1202,52 @@ func runtimeMetricSnapshot(names []string) map[string]uint64 {
 	return out
 }
 
+func currentMonitoringRuntimeSnapshot() *monitoringRuntimeSnapshot {
+	now := time.Now()
+	if cached := runtimeSnapshotCache.Load(); cached != nil && now.Sub(cached.captured) < runtimeSnapshotTTL {
+		return cached
+	}
+
+	runtimeSnapshotMu.Lock()
+	defer runtimeSnapshotMu.Unlock()
+	if cached := runtimeSnapshotCache.Load(); cached != nil && now.Sub(cached.captured) < runtimeSnapshotTTL {
+		return cached
+	}
+
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	snapshot := &monitoringRuntimeSnapshot{
+		captured: now,
+		memory: memoryStatsSnapshot{
+			Alloc:      memStats.Alloc,
+			TotalAlloc: memStats.TotalAlloc,
+			Sys:        memStats.Sys,
+			NumGC:      memStats.NumGC,
+		},
+		scheduler: runtimeMetricSnapshot(schedulerMetricNames),
+	}
+	runtimeSnapshotCache.Store(snapshot)
+	return snapshot
+}
+
+func expvarIntMapSnapshot(values *expvar.Map) map[string]int64 {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]int64)
+	values.Do(func(entry expvar.KeyValue) {
+		switch value := entry.Value.(type) {
+		case *expvar.Int:
+			out[entry.Key] = value.Value()
+		case expvar.Func:
+			if integer, ok := value.Value().(int64); ok {
+				out[entry.Key] = integer
+			}
+		}
+	})
+	return out
+}
+
 // --- gRPC Service Implementation ---
 type harpService struct {
 	pb.UnimplementedHarpServiceServer
@@ -946,25 +1286,33 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 		if routeDomain == "" {
 			routeDomain = reg.Domain
 		}
-		patternStr := routeDomain + r.Path
-		pattern, err := regexp.Compile(patternStr)
+		domainPattern, err := regexp.Compile("^(?:" + routeDomain + ")$")
 		if err != nil {
-			logError("Error compiling regexp for route %s: %v", r.Path, err)
+			logError("Error compiling domain regexp for route %s: %v", r.Path, err)
 			continue
 		}
 		authRule, _ := allowedRegistrationFor(r.Path, reg.Key)
-		conn.routes = append(conn.routes, registeredRoute{
-			name:     r.Name,
-			pattern:  pattern,
-			domain:   routeDomain,
-			path:     r.Path,
-			username: authRule.username,
-			password: authRule.password,
-		})
+		route := registeredRoute{
+			name:          r.Name,
+			domainPattern: domainPattern,
+			domain:        routeDomain,
+			path:          r.Path,
+			username:      authRule.username,
+			password:      authRule.password,
+			metrics:       metrics.routeMetricsFor(r.Path),
+		}
 		backendsMu.Lock()
-		addBackendToPool(backendKey(routeDomain, r.Path), conn.routes[len(conn.routes)-1], conn)
+		added := addBackendToPool(backendKey(routeDomain, r.Path), route, conn)
 		backendsMu.Unlock()
+		if !added {
+			logWarn("Route pool is full for %s%s (limit: %d)", routeDomain, r.Path, config.ConnectionPoolSize)
+			continue
+		}
+		conn.routes = append(conn.routes, route)
 		logDebug("Registered route: %s%s", routeDomain, r.Path)
+	}
+	if len(conn.routes) == 0 {
+		return fmt.Errorf("no route capacity available")
 	}
 
 	metrics.BackendsRegistered.Add(1)
@@ -977,6 +1325,7 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 			clientMsg, err := stream.Recv()
 			if err != nil {
 				logWarn("Backend %s disconnected: %v", reg.Name, err)
+				conn.failed.Store(true)
 				// Cleanup backend registration
 				backendsMu.Lock()
 				for _, route := range conn.routes {
@@ -1018,7 +1367,7 @@ func backendKey(domain, path string) string {
 	return domain + "\x00" + path
 }
 
-func addBackendToPool(key string, route registeredRoute, conn *backendConn) {
+func addBackendToPool(key string, route registeredRoute, conn *backendConn) bool {
 	pool, ok := backends[key]
 	if !ok {
 		pool = &backendPool{
@@ -1028,14 +1377,22 @@ func addBackendToPool(key string, route registeredRoute, conn *backendConn) {
 		backends[key] = pool
 		backendIndex = append(backendIndex, pool)
 		sortBackendIndex(backendIndex)
-		return
+		backendPathIndex[route.path] = append(backendPathIndex[route.path], pool)
+		backendIndexedPools++
+		routeSnapshotGeneration.Add(1)
+		return true
 	}
 	for _, existing := range pool.conns {
 		if existing == conn {
-			return
+			return true
 		}
 	}
+	if config.ConnectionPoolSize > 0 && len(pool.conns) >= config.ConnectionPoolSize {
+		return false
+	}
 	pool.conns = append(pool.conns, conn)
+	routeSnapshotGeneration.Add(1)
+	return true
 }
 
 func removeBackendFromPool(key string, conn *backendConn) {
@@ -1046,6 +1403,7 @@ func removeBackendFromPool(key string, conn *backendConn) {
 	for i, existing := range pool.conns {
 		if existing == conn {
 			pool.conns = append(pool.conns[:i], pool.conns[i+1:]...)
+			routeSnapshotGeneration.Add(1)
 			break
 		}
 	}
@@ -1058,6 +1416,21 @@ func removeBackendFromPool(key string, conn *backendConn) {
 				backendIndex = backendIndex[:len(backendIndex)-1]
 				break
 			}
+		}
+		pathPools := backendPathIndex[pool.route.path]
+		for i, indexedPool := range pathPools {
+			if indexedPool == pool {
+				copy(pathPools[i:], pathPools[i+1:])
+				pathPools[len(pathPools)-1] = nil
+				pathPools = pathPools[:len(pathPools)-1]
+				backendIndexedPools--
+				break
+			}
+		}
+		if len(pathPools) == 0 {
+			delete(backendPathIndex, pool.route.path)
+		} else {
+			backendPathIndex[pool.route.path] = pathPools
 		}
 	}
 }
@@ -1148,22 +1521,13 @@ func deliverPendingWebSocket(ctx context.Context, data *pb.WebSocketData, tunnel
 
 // --- HTTP Handler for Client Requests ---
 func httpHandler(w http.ResponseWriter, r *http.Request) {
-	if requestSem != nil {
-		select {
-		case requestSem <- struct{}{}:
-			defer func() { <-requestSem }()
-		default:
-			http.Error(w, "Server busy", http.StatusServiceUnavailable)
-			return
-		}
-	}
-
 	start := time.Now()
-	metricRoute := "_unmatched"
+	metricShard := uint64(start.UnixNano())
+	requestRouteMetrics := metrics.unmatchedRouteMetrics()
 	defer func() {
 		duration := time.Since(start)
 		metrics.RequestsTotal.Add(1)
-		metrics.RequestDuration.Add(metricRoute, int64(duration/time.Millisecond))
+		requestRouteMetrics.add(metricShard, duration)
 	}()
 
 	// CORS handling
@@ -1173,11 +1537,21 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 			origin = "*"
 		}
 		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	if requestSem != nil {
+		select {
+		case requestSem <- struct{}{}:
+			defer func() { <-requestSem }()
+		default:
+			http.Error(w, "Server busy", http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -1194,8 +1568,10 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	chosen, matchedRoute, routeAuth := matchBackend(r.Host, r.URL.Path)
 
 	if matchedRoute != "" {
-		metricRoute = matchedRoute
-		metrics.RouteRequests.Add(matchedRoute, 1)
+		requestRouteMetrics = routeAuth.metrics
+		if requestRouteMetrics == nil {
+			requestRouteMetrics = metrics.routeMetricsFor(matchedRoute)
+		}
 	}
 
 	if chosen == nil {
@@ -1212,19 +1588,13 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		authenticatedRoute = true
 	}
 
-	// Enforce request body size limit
-	var bodyReader io.Reader = r.Body
-	if config.MaxRequestBodySize > 0 {
-		bodyReader = io.LimitReader(r.Body, config.MaxRequestBodySize+1)
-	}
-	bodyBytes, err := io.ReadAll(bodyReader)
+	bodyBytes, err := readRequestBody(r, config.MaxRequestBodySize)
 	if err != nil {
+		if errors.Is(err, errRequestBodyTooLarge) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "Error reading body", http.StatusBadRequest)
-		return
-	}
-	r.Body.Close()
-	if config.MaxRequestBodySize > 0 && int64(len(bodyBytes)) > config.MaxRequestBodySize {
-		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	bodyStr := string(bodyBytes)
@@ -1250,20 +1620,20 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheEnabled := config.EnableCache && cacheStore != nil && r.Method == http.MethodGet
+	cacheMethod, cacheLookup := cacheLookupMethod(r.Method)
+	cacheLookup = cacheLookup && config.EnableCache && cacheStore != nil
+	cacheStoreResponse := cacheLookup && r.Method == http.MethodGet
 	var cacheKey string
-	if cacheEnabled {
-		cacheKey = getCacheKey(r.Method, r.URL.String(), headers, bodyStr)
+	if cacheLookup {
+		cacheBody := bodyStr
+		if r.Method == http.MethodHead {
+			cacheBody = ""
+		}
+		cacheKey = getCacheKey(cacheMethod, r.URL.String(), headers, cacheBody)
 		if resp, ok := cacheStore.Get(cacheKey); ok {
 			logDebug("Cache hit for %s", r.URL.String())
 			metrics.CacheHits.Add(1)
-			respHeaders := filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues))
-			appendVia(respHeaders)
-			copyHTTPHeaders(w.Header(), respHeaders)
-			w.WriteHeader(int(resp.Status))
-			if body := pb.BodyBytesFromProto(resp.Body, resp.BodyBytes); len(body) > 0 {
-				_, _ = w.Write(body)
-			}
+			writeCachedResponse(w, r.Method, resp)
 			return
 		}
 		metrics.CacheMisses.Add(1)
@@ -1276,7 +1646,7 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		Headers:      headers,
 		HeaderValues: headerValues,
 		Body:         bodyStr,
-		BodyBytes:    append([]byte(nil), bodyBytes...),
+		BodyBytes:    bodyBytes,
 		RequestId:    reqID,
 		Timestamp:    time.Now().UnixNano(),
 	}
@@ -1290,9 +1660,20 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Send the HTTPRequest to the chosen backend.
 	serverMsg := &pb.ServerMessage{Payload: &pb.ServerMessage_HttpRequest{HttpRequest: httpReq}}
-	chosen.mu.Lock()
-	err = chosen.stream.Send(serverMsg)
-	chosen.mu.Unlock()
+	err = sendBackendMessage(chosen, serverMsg)
+	if err != nil {
+		chosen.failed.Store(true)
+		if isIdempotentMethod(r.Method) {
+			if replacement, _, _ := matchBackend(r.Host, r.URL.Path); replacement != nil && replacement != chosen {
+				logWarn("Backend send failed; retrying %s %s on another pooled connection", r.Method, r.URL.Path)
+				chosen = replacement
+				err = sendBackendMessage(chosen, serverMsg)
+				if err != nil {
+					chosen.failed.Store(true)
+				}
+			}
+		}
+	}
 	if err != nil {
 		http.Error(w, "Error forwarding request", http.StatusBadGateway)
 		logError("Error sending to backend: %v", err)
@@ -1312,27 +1693,32 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	case resp := <-respCh:
 		isStream := responseHeaderEnabled(resp, pb.StreamHeader)
 		firstStatus := int(resp.Status)
+		bodyAllowed := responseBodyAllowed(r.Method, firstStatus)
+		if !bodyAllowed {
+			isStream = false
+		}
 		firstHTTPHeaders := filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues))
 		appendVia(firstHTTPHeaders)
 		if isStream {
 			applyStreamDefaultsHTTP(firstHTTPHeaders, streamTypeFromResponse(resp))
 		}
 		firstHeaders := pb.HeaderMapFromHTTP(firstHTTPHeaders)
-		var bodyBuilder strings.Builder
 		var bodyBytesBuilder []byte
 		wroteHeaders := false
 		for {
+			respBody := pb.BodyBytesFromProto(resp.Body, resp.BodyBytes)
 			if !wroteHeaders {
+				if r.Method == http.MethodHead && firstHTTPHeaders.Get("Content-Length") == "" && responseBodyAllowed(http.MethodGet, firstStatus) {
+					firstHTTPHeaders.Set("Content-Length", strconv.Itoa(len(respBody)))
+				}
 				copyHTTPHeaders(w.Header(), firstHTTPHeaders)
 				w.WriteHeader(firstStatus)
 				wroteHeaders = true
 			}
 
-			respBody := pb.BodyBytesFromProto(resp.Body, resp.BodyBytes)
-			if len(respBody) > 0 {
+			if bodyAllowed && len(respBody) > 0 {
 				_, _ = w.Write(respBody)
-				if !isStream {
-					bodyBuilder.WriteString(string(respBody))
+				if cacheStoreResponse && !isStream {
 					bodyBytesBuilder = append(bodyBytesBuilder, respBody...)
 				}
 				if isStream && canFlush {
@@ -1341,12 +1727,12 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if !isStream || responseHeaderEnabled(resp, pb.StreamEndHeader) {
-				if cacheEnabled && !isStream {
+				if cacheStoreResponse && !isStream {
 					cacheStore.Set(cacheKey, &pb.HTTPResponse{
 						Status:       int32(firstStatus),
 						Headers:      firstHeaders,
 						HeaderValues: pb.HeaderValuesFromHTTP(firstHTTPHeaders),
-						Body:         bodyBuilder.String(),
+						Body:         string(bodyBytesBuilder),
 						BodyBytes:    bodyBytesBuilder,
 					})
 				}
@@ -1369,6 +1755,22 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		metrics.BackendErrors.Add(1)
 	case <-r.Context().Done():
 		return
+	}
+}
+
+func sendBackendMessage(conn *backendConn, msg *pb.ServerMessage) error {
+	conn.mu.Lock()
+	err := conn.stream.Send(msg)
+	conn.mu.Unlock()
+	return err
+}
+
+func isIdempotentMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1397,13 +1799,22 @@ func resetTimer(timer *time.Timer, timeout time.Duration) {
 type routeAuthConfig struct {
 	username string
 	password string
+	metrics  *routeMetrics
 }
 
 func matchBackend(host, path string) (*backendConn, string, routeAuthConfig) {
-	requestRoute := routeTarget(host, path)
+	requestHost := routeHost(host)
 
 	backendsMu.RLock()
 	defer backendsMu.RUnlock()
+	if backendIndexedPools == len(backends) {
+		if conn, route, auth, ok := matchBackendByPathIndex(requestHost, path); ok {
+			return conn, route, auth
+		}
+		return nil, "", routeAuthConfig{}
+	}
+
+	var legacyRequestRoute string
 	pools := backendIndex
 	// Tests and embedders may replace the legacy map directly. Reconstruct a
 	// local ordered view in that exceptional case; production updates maintain
@@ -1417,17 +1828,105 @@ func matchBackend(host, path string) (*backendConn, string, routeAuthConfig) {
 	}
 	for _, pool := range pools {
 		route := pool.route
-		if len(pool.conns) == 0 || !matchesRegisteredRoute(path, route.path) || !route.pattern.MatchString(requestRoute) {
+		if len(pool.conns) == 0 || !matchesRegisteredRoute(path, route.path) {
 			continue
 		}
-		auth := routeAuthConfig{username: route.username, password: route.password}
-		if config.LoadBalancingStrategy == loadBalancingFirst {
-			return pool.conns[0], route.path, auth
+		domainMatches := false
+		if route.domainPattern != nil {
+			domainMatches = route.domainPattern.MatchString(requestHost)
+		} else if route.pattern != nil {
+			if legacyRequestRoute == "" {
+				legacyRequestRoute = requestHost + path
+			}
+			domainMatches = route.pattern.MatchString(legacyRequestRoute)
 		}
-		idx := atomic.AddUint64(&pool.next, 1) - 1
-		return pool.conns[int(idx%uint64(len(pool.conns)))], route.path, auth
+		if !domainMatches {
+			continue
+		}
+		auth := routeAuthConfig{username: route.username, password: route.password, metrics: route.metrics}
+		if conn := selectBackendConnection(pool); conn != nil {
+			return conn, route.path, auth
+		}
 	}
 	return nil, "", routeAuthConfig{}
+}
+
+func matchBackendByPathIndex(host, path string) (*backendConn, string, routeAuthConfig, bool) {
+	if conn, route, auth, ok := matchBackendPools(backendPathIndex[path], host, path); ok {
+		return conn, route, auth, true
+	}
+
+	searchEnd := len(path)
+	if searchEnd > 1 && path[searchEnd-1] == '/' {
+		searchEnd--
+		if conn, route, auth, ok := matchBackendPools(backendPathIndex[path[:searchEnd]], host, path); ok {
+			return conn, route, auth, true
+		}
+	}
+	for searchEnd > 0 {
+		slash := strings.LastIndexByte(path[:searchEnd], '/')
+		if slash < 0 {
+			break
+		}
+		if slash == 0 {
+			if conn, route, auth, ok := matchBackendPools(backendPathIndex["/"], host, path); ok {
+				return conn, route, auth, true
+			}
+			break
+		}
+		if conn, route, auth, ok := matchBackendPools(backendPathIndex[path[:slash+1]], host, path); ok {
+			return conn, route, auth, true
+		}
+		if conn, route, auth, ok := matchBackendPools(backendPathIndex[path[:slash]], host, path); ok {
+			return conn, route, auth, true
+		}
+		searchEnd = slash
+	}
+	return nil, "", routeAuthConfig{}, false
+}
+
+func matchBackendPools(pools []*backendPool, host, path string) (*backendConn, string, routeAuthConfig, bool) {
+	for _, pool := range pools {
+		route := pool.route
+		if len(pool.conns) == 0 || !matchesRegisteredRoute(path, route.path) {
+			continue
+		}
+		domainMatches := route.domainPattern != nil && route.domainPattern.MatchString(host)
+		if !domainMatches && route.domainPattern == nil && route.pattern != nil {
+			domainMatches = route.pattern.MatchString(host + path)
+		}
+		if !domainMatches {
+			continue
+		}
+		auth := routeAuthConfig{username: route.username, password: route.password, metrics: route.metrics}
+		if conn := selectBackendConnection(pool); conn != nil {
+			return conn, route.path, auth, true
+		}
+	}
+	return nil, "", routeAuthConfig{}, false
+}
+
+func selectBackendConnection(pool *backendPool) *backendConn {
+	count := len(pool.conns)
+	if count == 0 {
+		return nil
+	}
+	if config.LoadBalancingStrategy == loadBalancingFirst {
+		for _, conn := range pool.conns {
+			if !conn.failed.Load() {
+				return conn
+			}
+		}
+		return nil
+	}
+	start := atomic.AddUint64(&pool.next, 1) - 1
+	for offset := 0; offset < count; offset++ {
+		conn := pool.conns[int((start+uint64(offset))%uint64(count))]
+		if !conn.failed.Load() {
+			return conn
+		}
+	}
+	return nil
 }
 
 func matchesRegisteredRoute(requestPath, routePath string) bool {
@@ -1441,10 +1940,25 @@ func matchesRegisteredRoute(requestPath, routePath string) bool {
 }
 
 func routeTarget(host, path string) string {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+	return routeHost(host) + path
+}
+
+func routeHost(host string) string {
+	if host == "" || !strings.Contains(host, ":") {
+		return host
 	}
-	return host + path
+	if host[0] == '[' {
+		if end := strings.IndexByte(host, ']'); end > 0 {
+			return host[1:end]
+		}
+		return host
+	}
+	// A non-bracketed host with exactly one colon is a hostname/IPv4 address
+	// followed by a port. Multiple colons are an unbracketed IPv6 literal.
+	if strings.Count(host, ":") == 1 {
+		return host[:strings.LastIndexByte(host, ':')]
+	}
+	return host
 }
 
 func clientIPFromRemoteAddr(remoteAddr string) string {
@@ -2043,6 +2557,12 @@ func validateConfig(config Config) error {
 	}
 	if config.EnableAdminUI && !config.AdminInsecureSkipAuth && config.AdminPassword == "" {
 		errs = append(errs, errors.New("enableAdminUI requires adminPassword unless adminInsecureSkipAuth is true"))
+	}
+	if config.ConnectionPoolSize < 0 {
+		errs = append(errs, errors.New("connectionPoolSize must not be negative"))
+	}
+	if config.CacheMaxItems < 0 {
+		errs = append(errs, errors.New("cacheMaxItems must not be negative"))
 	}
 	for _, field := range []struct {
 		name  string

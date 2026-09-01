@@ -58,6 +58,11 @@ Strategies:
 - `first`: always use the first registered backend. Useful for deterministic
   debugging or active/passive operational models.
 
+Set `connectionPoolSize` to cap registered backend streams per route. Failed
+streams are removed from selection immediately; idempotent requests can fail
+over once to another healthy stream. Size the memory cache independently with
+`cacheMaxItems`.
+
 ## systemd
 
 Install binaries and config:

@@ -52,9 +52,10 @@ HARP allows your internal servers (or devices like Raspberry Pis) to securely ex
 
 - **Per-route authentication** with regex matching and secret keys
 - **In-memory and disk-based caching** with configurable TTL and LRU eviction
+- **HEAD-aware caching** — HEAD reuses cached GET metadata without transferring the response body
 - **Rate limiting** per client IP with automatic memory cleanup
-- **Request body size limits** to prevent abuse and OOM
-- **CORS support** with configurable allowed origins
+- **Request body size limits** with early rejection for known oversized POST/PUT/PATCH payloads
+- **CORS support** with lightweight local OPTIONS preflight handling
 - **X-Request-ID tracing** — every proxied response includes a unique request ID header
 - **Round-robin load balancing** across multiple backends registered for the same route
 - **Per-route metrics** — track request counts per route via `/metrics`
@@ -63,7 +64,7 @@ HARP allows your internal servers (or devices like Raspberry Pis) to securely ex
 - **Prometheus-style metrics** and pprof profiling endpoints
 - **HTTP, HTTPS, and HTTP/3** support
 - **Config validation** on startup (TLS, regex, duration parsing)
-- **Auto-reconnecting backends** with configurable reconnect interval
+- **Auto-reconnecting backends** with ClientConn reuse and jittered exponential backoff
 - **Two integration modes:** `BackendServer` (wrap `http.Handler`) and `RemoteHelper` (function-based)
 
 ---
@@ -192,7 +193,9 @@ The `config.json` file controls the proxy behavior:
 | `enableCache` | bool | `true` | Enable response caching |
 | `cacheType` | string | `memory` | `memory` or `disk` |
 | `cacheTTL` | string | `30m` | Cache entry TTL (Go duration) |
+| `cacheMaxItems` | int | `1000` | Maximum entries in the in-memory cache |
 | `loadBalancingStrategy` | string | `round_robin` | Backend selection for identical routes: `round_robin` or `first` |
+| `connectionPoolSize` | int | `100` | Maximum registered backend connections per domain/path route pool |
 | `enableRateLimit` | bool | `true` | Enable per-IP rate limiting |
 | `rateLimitPerSecond` | int | `100` | Max requests per second per IP |
 | `maxRequestBodySize` | int | `10485760` | Max request body in bytes (10 MB) |
@@ -484,7 +487,22 @@ make build-gateway
 3. The gateway strips the `/homeassistant` prefix (if configured), adds any extra headers, and forwards to `http://localhost:8123/api/states`.
 4. The upstream response is relayed back through gRPC to the proxy and then to the client.
 
-Auto-reconnect is built in — if the connection to the proxy drops, the gateway retries every `reconnectInterval`.
+Auto-reconnect is built in. `reconnectInterval` is the initial retry delay;
+repeated failures use jittered exponential backoff toward a roughly one-minute
+ceiling, avoiding a
+reconnect stampede when many gateways lose the proxy simultaneously. The gRPC
+`ClientConn` is retained across stream reconnects, and the backoff resets after
+a stable connection. Go integrations can use `ListenAndServeContext` or
+`ListenAndServeHarpContext` for immediate cancellation during shutdown.
+
+Route pools skip failed streams immediately. If sending an idempotent request
+(`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`, or `TRACE`) fails, HARP retries once
+on another healthy pooled backend. Non-idempotent `POST`, `PATCH`, and `CONNECT`
+requests are never duplicated automatically.
+
+`connectionPoolSize` now limits backend connections per route as its name
+implies. Older releases accidentally used this value only to size the memory
+cache; set `cacheMaxItems` when an explicit cache capacity is required.
 
 HARP behaves like a standard reverse proxy for forwarded request metadata:
 hop-by-hop headers such as `Connection`, `Keep-Alive`, `TE`, `Trailer`,
@@ -538,7 +556,7 @@ When `enableMetrics` is `true`, a separate HTTP server starts on `metricsPort` e
 
 | Endpoint | Description |
 |----------|-------------|
-| `/metrics` | JSON metrics: request totals, cache hits/misses, backend errors, per-route counts, rate-limited requests, memory stats |
+| `/metrics` | JSON metrics: request totals, cache hits/misses, backend errors, `route_requests`, `request_duration_ms`, rate-limited requests, memory and scheduler stats |
 | `/health` | Backwards-compatible health check with uptime and connected backend count |
 | `/healthz` | Kubernetes-style general health check |
 | `/livez` | Liveness check: process is alive |
@@ -553,7 +571,8 @@ Every proxied response includes an `X-Request-ID` header for end-to-end tracing.
 Set `enableAdminUI` to `true` to serve a lightweight dashboard at `adminPath`
 (default `/admin`). It shows current backend routes, request counters, cache
 state, load-balancing strategy, Admin security posture, and Go runtime scheduler
-metrics. When enabled, Admin Basic Auth is required by default: set
+metrics. Runtime samples and sorted route snapshots are briefly shared between
+concurrent refreshes to keep polling overhead low. When enabled, Admin Basic Auth is required by default: set
 `adminPassword`, and optionally restrict access further with `adminAllowedCIDRs`.
 Use `adminInsecureSkipAuth: true` only for isolated local testing. Keep the UI
 disabled on public deployments unless the surrounding network or reverse proxy

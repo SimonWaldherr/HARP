@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"expvar"
+	"fmt"
+	"io"
 	"maps"
 	"net"
 	"net/http"
@@ -40,6 +43,157 @@ func TestGetCacheKey(t *testing.T) {
 	key4 := getCacheKey("GET", "/other", headers, "")
 	if key1 == key4 {
 		t.Errorf("different URLs should produce different cache keys")
+	}
+}
+
+func TestCacheLookupMethod(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		cacheMethod, ok := cacheLookupMethod(method)
+		if !ok || cacheMethod != http.MethodGet {
+			t.Fatalf("cacheLookupMethod(%q) = %q, %v", method, cacheMethod, ok)
+		}
+	}
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions} {
+		if cacheMethod, ok := cacheLookupMethod(method); ok || cacheMethod != "" {
+			t.Fatalf("cacheLookupMethod(%q) unexpectedly enabled caching", method)
+		}
+	}
+}
+
+func TestResponseBodyAllowed(t *testing.T) {
+	tests := []struct {
+		method string
+		status int
+		want   bool
+	}{
+		{http.MethodGet, http.StatusOK, true},
+		{http.MethodPost, http.StatusCreated, true},
+		{http.MethodHead, http.StatusOK, false},
+		{http.MethodGet, http.StatusContinue, false},
+		{http.MethodGet, http.StatusNoContent, false},
+		{http.MethodGet, http.StatusNotModified, false},
+	}
+	for _, tc := range tests {
+		if got := responseBodyAllowed(tc.method, tc.status); got != tc.want {
+			t.Errorf("responseBodyAllowed(%q, %d) = %v, want %v", tc.method, tc.status, got, tc.want)
+		}
+	}
+}
+
+func TestWriteCachedResponseHandlesHEAD(t *testing.T) {
+	resp := &pb.HTTPResponse{
+		Status:  http.StatusOK,
+		Headers: map[string]string{"Content-Type": "text/plain"},
+		Body:    "cached body",
+	}
+	rec := httptest.NewRecorder()
+	writeCachedResponse(rec, http.MethodHead, resp)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("HEAD response included %d body bytes", rec.Body.Len())
+	}
+	if got := rec.Header().Get("Content-Length"); got != strconv.Itoa(len(resp.Body)) {
+		t.Fatalf("Content-Length = %q, want %d", got, len(resp.Body))
+	}
+	if got := rec.Header().Get("Via"); got != "1.1 harp" {
+		t.Fatalf("Via = %q", got)
+	}
+}
+
+func TestWriteCachedResponseSuppressesNoContentBody(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeCachedResponse(rec, http.MethodPost, &pb.HTTPResponse{Status: http.StatusNoContent, Body: "invalid"})
+	if rec.Body.Len() != 0 {
+		t.Fatalf("204 response included %d body bytes", rec.Body.Len())
+	}
+}
+
+type trackedReadCloser struct {
+	reader bytes.Reader
+	reads  int
+	closed bool
+}
+
+func newTrackedReadCloser(body []byte) *trackedReadCloser {
+	reader := &trackedReadCloser{}
+	reader.reader.Reset(body)
+	return reader
+}
+
+func (r *trackedReadCloser) Read(p []byte) (int, error) {
+	r.reads++
+	return r.reader.Read(p)
+}
+
+func (r *trackedReadCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
+func TestReadRequestBodyRejectsKnownOversizeWithoutReading(t *testing.T) {
+	body := newTrackedReadCloser([]byte("oversized"))
+	req := &http.Request{Body: body, ContentLength: 9}
+	_, err := readRequestBody(req, 4)
+	if !errors.Is(err, errRequestBodyTooLarge) {
+		t.Fatalf("expected body-too-large error, got %v", err)
+	}
+	if body.reads != 0 {
+		t.Fatalf("oversized body was read %d times", body.reads)
+	}
+	if !body.closed {
+		t.Fatal("oversized body was not closed")
+	}
+}
+
+func TestReadRequestBodyLimitsUnknownLength(t *testing.T) {
+	req := &http.Request{Body: io.NopCloser(strings.NewReader("oversized")), ContentLength: -1}
+	_, err := readRequestBody(req, 4)
+	if !errors.Is(err, errRequestBodyTooLarge) {
+		t.Fatalf("expected body-too-large error, got %v", err)
+	}
+}
+
+func TestReadRequestBodyAcceptsShortKnownLength(t *testing.T) {
+	req := &http.Request{
+		Body:          io.NopCloser(strings.NewReader("short")),
+		ContentLength: 10,
+	}
+	body, err := readRequestBody(req, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(body) != "short" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestCORSPreflightBypassesFullRequestSemaphore(t *testing.T) {
+	originalConfig := config
+	originalMetrics := metrics
+	originalRequestSem := requestSem
+	config.EnableCORS = true
+	metrics = newTestMetrics()
+	requestSem = make(chan struct{}, 1)
+	requestSem <- struct{}{}
+	t.Cleanup(func() {
+		config = originalConfig
+		metrics = originalMetrics
+		requestSem = originalRequestSem
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodOptions, "/api", nil)
+	httpHandler(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", rec.Code)
+	}
+	if methods := rec.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(methods, http.MethodHead) {
+		t.Fatalf("HEAD missing from allowed methods: %q", methods)
+	}
+	if got := metrics.RequestsTotal.Value(); got != 1 {
+		t.Fatalf("request count = %d, want 1", got)
 	}
 }
 
@@ -117,8 +271,8 @@ func TestRateLimiter(t *testing.T) {
 	config.EnableRateLimit = true
 	t.Cleanup(func() { config.EnableRateLimit = origEnabled })
 	rl := NewRateLimiter(3)
-	now := time.Unix(1_000, 0)
-	rl.now = func() time.Time { return now }
+	var now time.Duration
+	rl.now = func() time.Duration { return now }
 
 	ip := "127.0.0.1"
 	for i := 0; i < 3; i++ {
@@ -131,7 +285,7 @@ func TestRateLimiter(t *testing.T) {
 		t.Error("4th request in same second should be rate limited")
 	}
 
-	now = now.Add(time.Second)
+	now += time.Second
 	if !rl.Allow(ip) {
 		t.Error("request should be allowed once the oldest entry leaves the sliding window")
 	}
@@ -171,8 +325,7 @@ func TestRateLimiterConcurrentClients(t *testing.T) {
 	t.Cleanup(func() { config.EnableRateLimit = originalEnabled })
 
 	rl := NewRateLimiter(2)
-	fixedNow := time.Unix(1_000, 0)
-	rl.now = func() time.Time { return fixedNow }
+	rl.now = func() time.Duration { return 0 }
 
 	const clients = 256
 	errors := make(chan string, clients)
@@ -241,6 +394,36 @@ func TestInitMetrics(t *testing.T) {
 	}
 }
 
+func TestRouteMetricsConcurrentSnapshot(t *testing.T) {
+	testMetrics := newTestMetrics()
+	route := testMetrics.routeMetricsFor("/api")
+	const goroutines = 32
+	const updates = 1000
+
+	var wg sync.WaitGroup
+	for worker := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for update := range updates {
+				route.add(uint64(worker*updates+update), time.Millisecond)
+			}
+		}()
+	}
+	wg.Wait()
+
+	want := int64(goroutines * updates)
+	if got := route.requestCount(); got != want {
+		t.Fatalf("request count = %d, want %d", got, want)
+	}
+	if got := route.durationMillisTotal(); got != want {
+		t.Fatalf("duration total = %d, want %d", got, want)
+	}
+	if got := expvarIntMapSnapshot(testMetrics.RouteRequests)["/api"]; got != want {
+		t.Fatalf("exported request count = %d, want %d", got, want)
+	}
+}
+
 func TestMemoryCacheEviction(t *testing.T) {
 	origTTL := config.CacheTTL
 	origPool := config.ConnectionPoolSize
@@ -274,6 +457,18 @@ func TestMemoryCacheEviction(t *testing.T) {
 	// The new item should be present
 	if _, ok := mc.Get("d"); !ok {
 		t.Error("expected 'd' to be in cache")
+	}
+}
+
+func TestMemoryCacheUsesIndependentCapacity(t *testing.T) {
+	originalConfig := config
+	config.ConnectionPoolSize = 1
+	config.CacheMaxItems = 7
+	t.Cleanup(func() { config = originalConfig })
+
+	cache := NewMemoryCache()
+	if cache.maxItems != 7 {
+		t.Fatalf("cache capacity = %d, want 7", cache.maxItems)
 	}
 }
 
@@ -337,8 +532,8 @@ func TestRateLimiterCleanup(t *testing.T) {
 	t.Cleanup(func() { config.EnableRateLimit = origEnabled })
 
 	rl := NewRateLimiter(100)
-	now := time.Unix(1_000, 0)
-	rl.now = func() time.Time { return now }
+	var now time.Duration
+	rl.now = func() time.Duration { return now }
 
 	// Add some requests
 	rl.Allow("10.0.0.1")
@@ -349,7 +544,7 @@ func TestRateLimiterCleanup(t *testing.T) {
 	}
 
 	// Advance the injected clock so cleanup remains deterministic and fast.
-	now = now.Add(time.Second)
+	now += time.Second
 
 	rl.Cleanup()
 
@@ -437,6 +632,154 @@ func BenchmarkRateLimiterParallel(b *testing.B) {
 			rl.Allow(clientIP)
 		}
 	})
+}
+
+func BenchmarkBackendRoutingManyRoutes(b *testing.B) {
+	originalBackends := backends
+	originalIndex := backendIndex
+	originalPathIndex := backendPathIndex
+	originalIndexedPools := backendIndexedPools
+	originalStrategy := config.LoadBalancingStrategy
+	backendsMu.Lock()
+	backends = make(map[string]*backendPool)
+	backendIndex = nil
+	backendPathIndex = make(map[string][]*backendPool)
+	backendIndexedPools = 0
+	for i := 0; i < 1_000; i++ {
+		routePath := fmt.Sprintf("/route/%04d", i)
+		route := registeredRoute{
+			path:          routePath,
+			domain:        `example\.com`,
+			domainPattern: regexp.MustCompile(`^example\.com$`),
+		}
+		conn := &backendConn{routes: []registeredRoute{route}}
+		addBackendToPool(backendKey(route.domain, route.path), route, conn)
+	}
+	backendsMu.Unlock()
+	config.LoadBalancingStrategy = loadBalancingFirst
+	b.Cleanup(func() {
+		config.LoadBalancingStrategy = originalStrategy
+		backendsMu.Lock()
+		backends = originalBackends
+		backendIndex = originalIndex
+		backendPathIndex = originalPathIndex
+		backendIndexedPools = originalIndexedPools
+		backendsMu.Unlock()
+	})
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			backend, _, _ := matchBackend("example.com", "/route/0999/items")
+			if backend == nil {
+				b.Fatal("expected matching backend")
+			}
+		}
+	})
+}
+
+func BenchmarkMetricsHandler(b *testing.B) {
+	originalMetrics := metrics
+	originalCache := cacheStore
+	metrics = newTestMetrics()
+	cacheStore = NewMemoryCache()
+	b.Cleanup(func() {
+		metrics = originalMetrics
+		cacheStore = originalCache
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		rec := httptest.NewRecorder()
+		metricsHandler(rec, req)
+	}
+}
+
+func BenchmarkAdminStatusHandler(b *testing.B) {
+	originalConfig := config
+	originalMetrics := metrics
+	originalCache := cacheStore
+	originalStart := startTime
+	config.AdminInsecureSkipAuth = true
+	metrics = newTestMetrics()
+	cacheStore = NewMemoryCache()
+	startTime = time.Now().Add(-time.Hour)
+	b.Cleanup(func() {
+		config = originalConfig
+		metrics = originalMetrics
+		cacheStore = originalCache
+		startTime = originalStart
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/status", nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		rec := httptest.NewRecorder()
+		adminStatusHandler(rec, req)
+	}
+}
+
+func BenchmarkRouteMetricsParallel(b *testing.B) {
+	testMetrics := newTestMetrics()
+	route := testMetrics.routeMetricsFor("/api")
+	var sequence atomic.Uint64
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			route.add(sequence.Add(1), time.Millisecond)
+		}
+	})
+}
+
+func BenchmarkReadRequestBody(b *testing.B) {
+	payload := bytes.Repeat([]byte("x"), 64<<10)
+	b.Run("POST-64KiB", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			req := &http.Request{
+				Method:        http.MethodPost,
+				Body:          io.NopCloser(bytes.NewReader(payload)),
+				ContentLength: int64(len(payload)),
+			}
+			body, err := readRequestBody(req, int64(len(payload)))
+			if err != nil || len(body) != len(payload) {
+				b.Fatal("unexpected body read result")
+			}
+		}
+	})
+	b.Run("POST-known-oversize", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			req := &http.Request{
+				Method:        http.MethodPost,
+				Body:          io.NopCloser(bytes.NewReader(payload)),
+				ContentLength: int64(len(payload)),
+			}
+			if _, err := readRequestBody(req, 1024); !errors.Is(err, errRequestBodyTooLarge) {
+				b.Fatal("expected body-too-large error")
+			}
+		}
+	})
+}
+
+func BenchmarkWriteCachedResponse(b *testing.B) {
+	resp := &pb.HTTPResponse{
+		Status:    http.StatusOK,
+		Headers:   map[string]string{"Content-Type": "application/octet-stream"},
+		BodyBytes: bytes.Repeat([]byte("x"), 64<<10),
+	}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		b.Run(method, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				writeCachedResponse(httptest.NewRecorder(), method, resp)
+			}
+		})
+	}
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
@@ -560,6 +903,8 @@ func TestValidateConfigCollectsErrors(t *testing.T) {
 		ReadTimeout:           "still-not-a-duration",
 		LoadBalancingStrategy: "random",
 		AdminAllowedCIDRs:     []string{"not-a-cidr"},
+		ConnectionPoolSize:    -1,
+		CacheMaxItems:         -1,
 		AllowedRegistration: []AllowedRegistrationRule{
 			{Route: "[", Key: "secret"},
 		},
@@ -578,6 +923,8 @@ func TestValidateConfigCollectsErrors(t *testing.T) {
 		"invalid cacheTTL",
 		"invalid readTimeout",
 		"invalid regex in allowedRegistration route",
+		"connectionPoolSize must not be negative",
+		"cacheMaxItems must not be negative",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("expected validation error %q in %q", want, msg)
@@ -1182,8 +1529,48 @@ func TestAdminStatusHandler(t *testing.T) {
 	}
 }
 
+func TestMetricsHandlerIncludesRouteMetrics(t *testing.T) {
+	originalMetrics := metrics
+	originalCache := cacheStore
+	metrics = newTestMetrics()
+	cacheStore = nil
+	t.Cleanup(func() {
+		metrics = originalMetrics
+		cacheStore = originalCache
+	})
+
+	route := metrics.routeMetricsFor("/api")
+	route.add(0, 3*time.Millisecond)
+	rec := httptest.NewRecorder()
+	metricsHandler(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	var body struct {
+		RouteRequests     map[string]int64 `json:"route_requests"`
+		RequestDurationMS map[string]int64 `json:"request_duration_ms"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid metrics response: %v", err)
+	}
+	if body.RouteRequests["/api"] != 1 || body.RequestDurationMS["/api"] != 3 {
+		t.Fatalf("unexpected route metrics: %#v %#v", body.RouteRequests, body.RequestDurationMS)
+	}
+}
+
+func TestAdminUIRejectsUnknownSubpath(t *testing.T) {
+	originalConfig := config
+	config.AdminPath = "/admin"
+	config.AdminInsecureSkipAuth = true
+	t.Cleanup(func() { config = originalConfig })
+
+	rec := httptest.NewRecorder()
+	adminUIHandler(rec, httptest.NewRequest(http.MethodGet, "/admin/unknown", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown admin subpath returned %d, want 404", rec.Code)
+	}
+}
+
 func newTestMetrics() *Metrics {
-	return &Metrics{
+	m := &Metrics{
 		RequestsTotal:      new(expvar.Int),
 		RequestDuration:    new(expvar.Map).Init(),
 		CacheHits:          new(expvar.Int),
@@ -1194,6 +1581,8 @@ func newTestMetrics() *Metrics {
 		RouteRequests:      new(expvar.Map).Init(),
 		RateLimited:        new(expvar.Int),
 	}
+	m.unmatched = m.routeMetricsFor("_unmatched")
+	return m
 }
 
 func TestClientIPFromRemoteAddr(t *testing.T) {
@@ -1213,25 +1602,41 @@ func TestClientIPFromRemoteAddr(t *testing.T) {
 	}
 }
 
+func TestRouteHost(t *testing.T) {
+	tests := map[string]string{
+		"example.com":       "example.com",
+		"example.com:8443":  "example.com",
+		"127.0.0.1:8080":    "127.0.0.1",
+		"[2001:db8::1]:443": "2001:db8::1",
+		"[2001:db8::1]":     "2001:db8::1",
+		"2001:db8::1":       "2001:db8::1",
+	}
+	for input, want := range tests {
+		if got := routeHost(input); got != want {
+			t.Errorf("routeHost(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestMatchBackendUsesHostAndPath(t *testing.T) {
 	origBackends := backends
 	backendsMu.Lock()
 	exampleBackend := &backendConn{
 		routes: []registeredRoute{{
-			name:     "example",
-			domain:   `example\.com`,
-			path:     "/api",
-			pattern:  regexp.MustCompile(`example\.com/api`),
-			username: "operator",
-			password: "route-password",
+			name:          "example",
+			domain:        `example\.com`,
+			domainPattern: regexp.MustCompile(`^example\.com$`),
+			path:          "/api",
+			username:      "operator",
+			password:      "route-password",
 		}},
 	}
 	otherBackend := &backendConn{
 		routes: []registeredRoute{{
-			name:    "other",
-			domain:  `other\.com`,
-			path:    "/api",
-			pattern: regexp.MustCompile(`other\.com/api`),
+			name:          "other",
+			domain:        `other\.com`,
+			domainPattern: regexp.MustCompile(`^other\.com$`),
+			path:          "/api",
 		}},
 	}
 	backends = map[string]*backendPool{
@@ -1342,17 +1747,120 @@ func TestMatchBackendRoundRobinWithinRoutePool(t *testing.T) {
 	}
 }
 
+func TestSelectBackendConnectionSkipsFailedConnections(t *testing.T) {
+	originalConfig := config
+	t.Cleanup(func() { config = originalConfig })
+	failed := &backendConn{}
+	failed.failed.Store(true)
+	firstHealthy := &backendConn{}
+	secondHealthy := &backendConn{}
+	pool := &backendPool{conns: []*backendConn{failed, firstHealthy, secondHealthy}}
+
+	config.LoadBalancingStrategy = loadBalancingFirst
+	if got := selectBackendConnection(pool); got != firstHealthy {
+		t.Fatalf("first strategy selected %#v, want first healthy connection", got)
+	}
+
+	config.LoadBalancingStrategy = loadBalancingRoundRobin
+	if got := selectBackendConnection(pool); got != firstHealthy {
+		t.Fatalf("round robin selected %#v, want first healthy connection", got)
+	}
+	if got := selectBackendConnection(pool); got != firstHealthy {
+		t.Fatalf("round robin selected %#v while skipping failed slot", got)
+	}
+	if got := selectBackendConnection(pool); got != secondHealthy {
+		t.Fatalf("round robin selected %#v, want second healthy connection", got)
+	}
+	firstHealthy.failed.Store(true)
+	secondHealthy.failed.Store(true)
+	if got := selectBackendConnection(pool); got != nil {
+		t.Fatalf("all-failed pool selected %#v", got)
+	}
+}
+
+func TestBackendPoolCapacity(t *testing.T) {
+	originalConfig := config
+	originalBackends := backends
+	originalIndex := backendIndex
+	originalPathIndex := backendPathIndex
+	originalIndexedPools := backendIndexedPools
+	config.ConnectionPoolSize = 2
+	backends = make(map[string]*backendPool)
+	backendIndex = nil
+	backendPathIndex = make(map[string][]*backendPool)
+	backendIndexedPools = 0
+	t.Cleanup(func() {
+		config = originalConfig
+		backends = originalBackends
+		backendIndex = originalIndex
+		backendPathIndex = originalPathIndex
+		backendIndexedPools = originalIndexedPools
+	})
+
+	route := registeredRoute{domain: `example\.com`, path: "/api"}
+	key := backendKey(route.domain, route.path)
+	if !addBackendToPool(key, route, &backendConn{}) || !addBackendToPool(key, route, &backendConn{}) {
+		t.Fatal("connections within pool capacity were rejected")
+	}
+	if addBackendToPool(key, route, &backendConn{}) {
+		t.Fatal("connection beyond pool capacity was accepted")
+	}
+	if got := len(backends[key].conns); got != 2 {
+		t.Fatalf("pool size = %d, want 2", got)
+	}
+}
+
+func TestIdempotentMethod(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete, http.MethodOptions, http.MethodTrace} {
+		if !isIdempotentMethod(method) {
+			t.Errorf("%s should be retryable", method)
+		}
+	}
+	for _, method := range []string{http.MethodPost, http.MethodPatch, http.MethodConnect} {
+		if isIdempotentMethod(method) {
+			t.Errorf("%s must not be retried automatically", method)
+		}
+	}
+}
+
+func BenchmarkBackendPoolSelectionParallel(b *testing.B) {
+	originalConfig := config
+	config.LoadBalancingStrategy = loadBalancingRoundRobin
+	b.Cleanup(func() { config = originalConfig })
+	pool := &backendPool{conns: make([]*backendConn, 64)}
+	for i := range pool.conns {
+		pool.conns[i] = &backendConn{}
+		if i%4 == 0 {
+			pool.conns[i].failed.Store(true)
+		}
+	}
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if selectBackendConnection(pool) == nil {
+				b.Fatal("no healthy connection selected")
+			}
+		}
+	})
+}
+
 func TestBackendIndexOrdersAndRemovesRoutes(t *testing.T) {
 	originalBackends := backends
 	originalIndex := backendIndex
+	originalPathIndex := backendPathIndex
+	originalIndexedPools := backendIndexedPools
 	backendsMu.Lock()
 	backends = make(map[string]*backendPool)
 	backendIndex = nil
+	backendPathIndex = make(map[string][]*backendPool)
+	backendIndexedPools = 0
 	backendsMu.Unlock()
 	t.Cleanup(func() {
 		backendsMu.Lock()
 		backends = originalBackends
 		backendIndex = originalIndex
+		backendPathIndex = originalPathIndex
+		backendIndexedPools = originalIndexedPools
 		backendsMu.Unlock()
 	})
 

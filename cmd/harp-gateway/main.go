@@ -41,7 +41,7 @@ type GatewayConfig struct {
 	Key string `json:"key"`
 	// Domain is the regex matched against incoming request domains (default ".*").
 	Domain string `json:"domain"`
-	// ReconnectInterval is the delay between reconnect attempts (default "5s").
+	// ReconnectInterval is the initial delay for jittered exponential reconnects (default "5s").
 	ReconnectInterval string `json:"reconnectInterval"`
 	// Services lists the local services to expose.
 	Services []ServiceConfig `json:"services"`

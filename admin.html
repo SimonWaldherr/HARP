@@ -187,19 +187,25 @@ function escapeHTML(value) {
 }
 
 async function load() {
+  if (load.pending) return;
+  load.pending = true;
   try {
     const res = await fetch(api, { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     render(await res.json());
   } catch (err) {
     $("status").textContent = "error";
-    $("routes").innerHTML = "<tr><td colspan=\"4\" class=\"error\">" + escapeHTML(err.message) + "</td></tr>";
+    $("routes").innerHTML = "<tr><td colspan=\"5\" class=\"error\">" + escapeHTML(err.message) + "</td></tr>";
+  } finally {
+    load.pending = false;
   }
 }
 
 $("refresh").addEventListener("click", load);
 load();
-setInterval(load, 5000);
+setInterval(() => {
+  if (!document.hidden) load();
+}, 5000);
 </script>
 </body>
 </html>

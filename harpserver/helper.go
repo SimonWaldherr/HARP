@@ -14,8 +14,6 @@ import (
 
 	pb "github.com/SimonWaldherr/HARP/harp"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
 )
 
 // HelperHandlerFunc processes an incoming HTTP request and returns a status
@@ -53,7 +51,7 @@ type HelperRoute struct {
 // a publicly reachable HARP instance.
 //
 // Auto-reconnect is built in: if the gRPC stream drops the helper will wait
-// ReconnectInterval and then re-register all routes transparently.
+// a jittered exponential delay and then re-register all routes transparently.
 type RemoteHelper struct {
 	// Name identifies this helper on the HARP proxy.
 	Name string
@@ -65,7 +63,7 @@ type RemoteHelper struct {
 	Domain string
 	// Routes contains the registered path→handler mappings.
 	Routes []HelperRoute
-	// ReconnectInterval is the delay between reconnect attempts (default: 5s).
+	// ReconnectInterval is the initial reconnect delay (default: 5s).
 	ReconnectInterval time.Duration
 }
 
@@ -98,39 +96,54 @@ func (h *RemoteHelper) RegisterSSE(path, name string, fn HelperStreamHandlerFunc
 // processes incoming requests. It blocks indefinitely and automatically
 // reconnects on stream failure.
 func (h *RemoteHelper) ListenAndServe() error {
+	return h.ListenAndServeContext(context.Background())
+}
+
+// ListenAndServeContext is the context-cancellable variant of ListenAndServe.
+// It retains one gRPC ClientConn across stream reconnects.
+func (h *RemoteHelper) ListenAndServeContext(ctx context.Context) error {
 	interval := h.ReconnectInterval
 	if interval <= 0 {
-		interval = 5 * time.Second
+		interval = defaultReconnectInterval
 	}
+	conn, err := newHarpClientConn(h.ProxyURL, interval)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	retry := newReconnectBackoff(interval, h.Name+"\x00"+h.ProxyURL)
 	for {
-		if err := h.connectOnce(); err != nil {
-			log.Printf("RemoteHelper %s disconnected: %v. Reconnecting in %s...", h.Name, err, interval)
+		connectedFor, serveErr := h.serveConnection(ctx, conn)
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		time.Sleep(interval)
+		if connectedFor >= stableConnectionDuration {
+			retry.Reset()
+		}
+		delay := retry.Next()
+		log.Printf("RemoteHelper %s disconnected: %v. Reconnecting in %s...", h.Name, serveErr, delay)
+		if err := waitForReconnect(ctx, delay); err != nil {
+			return err
+		}
 	}
 }
 
 // connectOnce performs a single connection attempt, registers all routes and
 // serves requests until the stream is closed or an error occurs.
 func (h *RemoteHelper) connectOnce() error {
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second,
-			Timeout:             5 * time.Second,
-			PermitWithoutStream: true,
-		}),
-	}
-
-	conn, err := grpc.NewClient(h.ProxyURL, opts...)
+	conn, err := newHarpClientConn(h.ProxyURL, h.ReconnectInterval)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	_, err = h.serveConnection(context.Background(), conn)
+	return err
+}
 
-	stream, err := pb.NewHarpServiceClient(conn).Proxy(context.Background())
+func (h *RemoteHelper) serveConnection(ctx context.Context, conn *grpc.ClientConn) (time.Duration, error) {
+	stream, err := pb.NewHarpServiceClient(conn).Proxy(ctx, grpc.WaitForReady(true))
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// Build route list for registration.
@@ -152,8 +165,9 @@ func (h *RemoteHelper) connectOnce() error {
 	if err := stream.Send(&pb.ClientMessage{
 		Payload: &pb.ClientMessage_Registration{Registration: reg},
 	}); err != nil {
-		return err
+		return 0, err
 	}
+	registeredAt := time.Now()
 	log.Printf("RemoteHelper %s registered with %d route(s)", h.Name, len(protoRoutes))
 
 	// Build a fast path→handler lookup map.
@@ -166,7 +180,7 @@ func (h *RemoteHelper) connectOnce() error {
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
-			return err
+			return time.Since(registeredAt), err
 		}
 		reqProto := msg.GetHttpRequest()
 		if reqProto == nil {

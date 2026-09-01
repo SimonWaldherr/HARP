@@ -13,8 +13,6 @@ import (
 
 	pb "github.com/SimonWaldherr/HARP/harp"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
 )
 
 // RouteConfig binds a route path to a dedicated HTTP handler.
@@ -46,47 +44,64 @@ type BackendServer struct {
 	// Routes registers multiple path→handler mappings.
 	// When set, the single Route/Handler fields are ignored.
 	Routes []RouteConfig
-	// ReconnectInterval is the delay between reconnect attempts.
+	// ReconnectInterval is the initial delay for jittered exponential reconnects.
 	// Zero (default) means no automatic reconnection.
 	ReconnectInterval time.Duration
 }
 
 // ListenAndServeHarp connects to the HARP proxy, registers the backend,
 // and listens for forwarded HTTP requests, dispatching them to the wrapped handler.
-// If ReconnectInterval > 0, it automatically reconnects on stream failure.
+// If ReconnectInterval > 0, it automatically reconnects on stream failure
+// while retaining the underlying gRPC ClientConn.
 func (s *BackendServer) ListenAndServeHarp() error {
-	if s.ReconnectInterval > 0 {
-		for {
-			if err := s.connect(); err != nil {
-				log.Printf("Backend %s disconnected: %v. Reconnecting in %s...", s.Name, err, s.ReconnectInterval)
-				time.Sleep(s.ReconnectInterval)
-			}
-		}
-	}
-	return s.connect()
+	return s.ListenAndServeHarpContext(context.Background())
 }
 
-func (s *BackendServer) connect() error {
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second,
-			Timeout:             5 * time.Second,
-			PermitWithoutStream: true,
-		}),
-	}
-
-	conn, err := grpc.NewClient(s.ProxyURL, opts...)
+// ListenAndServeHarpContext is the context-cancellable variant of
+// ListenAndServeHarp. One gRPC ClientConn is retained across stream reconnects.
+func (s *BackendServer) ListenAndServeHarpContext(ctx context.Context) error {
+	conn, err := newHarpClientConn(s.ProxyURL, s.ReconnectInterval)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	if s.ReconnectInterval <= 0 {
+		_, err = s.serveConnection(ctx, conn)
+		return err
+	}
 
-	client := pb.NewHarpServiceClient(conn)
-	ctx := context.Background()
-	stream, err := client.Proxy(ctx)
+	retry := newReconnectBackoff(s.ReconnectInterval, s.Name+"\x00"+s.ProxyURL)
+	for {
+		connectedFor, serveErr := s.serveConnection(ctx, conn)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if connectedFor >= stableConnectionDuration {
+			retry.Reset()
+		}
+		delay := retry.Next()
+		log.Printf("Backend %s disconnected: %v. Reconnecting in %s...", s.Name, serveErr, delay)
+		if err := waitForReconnect(ctx, delay); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *BackendServer) connect() error {
+	conn, err := newHarpClientConn(s.ProxyURL, s.ReconnectInterval)
 	if err != nil {
 		return err
+	}
+	defer conn.Close()
+	_, err = s.serveConnection(context.Background(), conn)
+	return err
+}
+
+func (s *BackendServer) serveConnection(ctx context.Context, conn *grpc.ClientConn) (time.Duration, error) {
+	client := pb.NewHarpServiceClient(conn)
+	stream, err := client.Proxy(ctx, grpc.WaitForReady(true))
+	if err != nil {
+		return 0, err
 	}
 
 	// Build route list and per-path handler map.
@@ -126,8 +141,9 @@ func (s *BackendServer) connect() error {
 	if err := stream.Send(&pb.ClientMessage{
 		Payload: &pb.ClientMessage_Registration{Registration: reg},
 	}); err != nil {
-		return err
+		return 0, err
 	}
+	registeredAt := time.Now()
 	log.Printf("Backend %s registered with %d route(s)", s.Name, len(protoRoutes))
 
 	var sendMu sync.Mutex
@@ -138,7 +154,7 @@ func (s *BackendServer) connect() error {
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
-			return err
+			return time.Since(registeredAt), err
 		}
 		if wsData := msg.GetWebsocketData(); wsData != nil {
 			wsMu.RLock()
