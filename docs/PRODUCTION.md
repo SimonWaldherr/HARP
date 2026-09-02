@@ -55,8 +55,14 @@ route pool.
 Strategies:
 
 - `round_robin`: spread requests across available backend connections.
+- `least_connections`: prefer the healthy backend with the fewest inflight
+  requests and long-lived connections.
 - `first`: always use the first registered backend. Useful for deterministic
   debugging or active/passive operational models.
+
+For rolling upgrades from pre-2.0 HARP releases, temporarily set
+`compatibilityMode` to `v1`; see the migration notes in the README. This mode
+does not weaken Admin authentication or registration keys.
 
 Set `connectionPoolSize` to cap registered backend streams per route. Failed
 streams are removed from selection immediately; idempotent requests can fail

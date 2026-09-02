@@ -184,6 +184,7 @@ The `config.json` file controls the proxy behavior:
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
+| `compatibilityMode` | string | empty | Set to `v1` during migration from pre-2.0 releases; `legacy` is accepted as an alias |
 | `grpcPort` | string | `:50054` | gRPC server listen address |
 | `httpPort` | string | `:8080` | HTTP server listen address |
 | `http3Port` | string | `:8445` | HTTP/3 (QUIC) listen address |
@@ -194,8 +195,10 @@ The `config.json` file controls the proxy behavior:
 | `cacheType` | string | `memory` | `memory` or `disk` |
 | `cacheTTL` | string | `30m` | Cache entry TTL (Go duration) |
 | `cacheMaxItems` | int | `1000` | Maximum entries in the in-memory cache |
-| `loadBalancingStrategy` | string | `round_robin` | Backend selection for identical routes: `round_robin` or `first` |
+| `loadBalancingStrategy` | string | `round_robin` | Backend selection: `round_robin`, `least_connections`, or `first` |
 | `connectionPoolSize` | int | `100` | Maximum registered backend connections per domain/path route pool |
+| `maxConcurrentRequests` | int | `1000` | Maximum concurrent non-WebSocket requests |
+| `maxConcurrentWebSockets` | int | `256` | Independent maximum for concurrent WebSocket connections |
 | `enableRateLimit` | bool | `true` | Enable per-IP rate limiting |
 | `rateLimitPerSecond` | int | `100` | Max requests per second per IP |
 | `maxRequestBodySize` | int | `10485760` | Max request body in bytes (10 MB) |
@@ -504,6 +507,17 @@ requests are never duplicated automatically.
 implies. Older releases accidentally used this value only to size the memory
 cache; set `cacheMaxItems` when an explicit cache capacity is required.
 
+For rolling migrations from pre-2.0 releases, set `compatibilityMode` to `v1`.
+This restores the legacy combined domain/path regular-expression matching,
+uses `connectionPoolSize * 10` as the memory-cache capacity when
+`cacheMaxItems` is unset, leaves backend connection pools unlimited, and leaves
+WebSockets unlimited when `maxConcurrentWebSockets` is unset. Explicit
+`cacheMaxItems` and `maxConcurrentWebSockets` values still take precedence;
+`connectionPoolSize` retains only its v1 cache-sizing meaning in this mode.
+Remove the mode after all route patterns and capacity settings have been
+migrated. Admin authentication and other security validation are never relaxed
+by compatibility mode.
+
 HARP behaves like a standard reverse proxy for forwarded request metadata:
 hop-by-hop headers such as `Connection`, `Keep-Alive`, `TE`, `Trailer`,
 `Transfer-Encoding`, `Upgrade`, and custom headers named by `Connection` are
@@ -556,7 +570,7 @@ When `enableMetrics` is `true`, a separate HTTP server starts on `metricsPort` e
 
 | Endpoint | Description |
 |----------|-------------|
-| `/metrics` | JSON metrics: request totals, cache hits/misses, backend errors, `route_requests`, `request_duration_ms`, rate-limited requests, memory and scheduler stats |
+| `/metrics` | JSON metrics including request/cache/error totals, per-route durations, `inflight_requests`, `active_websockets`, `active_streams`, memory, and scheduler stats |
 | `/health` | Backwards-compatible health check with uptime and connected backend count |
 | `/healthz` | Kubernetes-style general health check |
 | `/livez` | Liveness check: process is alive |

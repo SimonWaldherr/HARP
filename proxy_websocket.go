@@ -40,6 +40,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, chosen *backendConn
 		http.Error(w, "WebSocket upgrade not supported", http.StatusInternalServerError)
 		return
 	}
+	metrics.ActiveWebSockets.Add(1)
+	defer metrics.ActiveWebSockets.Add(-1)
 
 	reqID := uuid.New().String()
 	respCh := make(chan *pb.HTTPResponse, 1)
@@ -65,10 +67,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, chosen *backendConn
 		Timestamp:    time.Now().UnixNano(),
 	}
 
-	chosen.mu.Lock()
-	err := chosen.stream.Send(&pb.ServerMessage{Payload: &pb.ServerMessage_HttpRequest{HttpRequest: httpReq}})
-	chosen.mu.Unlock()
+	err := sendBackendMessage(chosen, &pb.ServerMessage{Payload: &pb.ServerMessage_HttpRequest{HttpRequest: httpReq}})
 	if err != nil {
+		chosen.failed.Store(true)
 		http.Error(w, "Error forwarding WebSocket upgrade", http.StatusBadGateway)
 		logError("Error sending WebSocket upgrade to backend: %v", err)
 		metrics.BackendErrors.Add(1)
@@ -205,19 +206,23 @@ func tunnelWebSocket(
 }
 
 func sendWebSocketData(chosen *backendConn, reqID string, data []byte) error {
-	chosen.mu.Lock()
-	defer chosen.mu.Unlock()
-	return chosen.stream.Send(&pb.ServerMessage{Payload: &pb.ServerMessage_WebsocketData{WebsocketData: &pb.WebSocketData{
+	err := sendBackendMessage(chosen, &pb.ServerMessage{Payload: &pb.ServerMessage_WebsocketData{WebsocketData: &pb.WebSocketData{
 		RequestId: reqID,
 		Data:      append([]byte(nil), data...),
 	}}})
+	if err != nil {
+		chosen.failed.Store(true)
+	}
+	return err
 }
 
 func sendWebSocketClose(chosen *backendConn, reqID string) error {
-	chosen.mu.Lock()
-	defer chosen.mu.Unlock()
-	return chosen.stream.Send(&pb.ServerMessage{Payload: &pb.ServerMessage_WebsocketData{WebsocketData: &pb.WebSocketData{
+	err := sendBackendMessage(chosen, &pb.ServerMessage{Payload: &pb.ServerMessage_WebsocketData{WebsocketData: &pb.WebSocketData{
 		RequestId: reqID,
 		Close:     true,
 	}}})
+	if err != nil {
+		chosen.failed.Store(true)
+	}
+	return err
 }

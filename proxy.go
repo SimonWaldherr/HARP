@@ -44,6 +44,7 @@ import (
 
 // Config holds proxy configuration parameters.
 type Config struct {
+	CompatibilityMode     string                    `json:"compatibilityMode"`
 	GRPCPort              string                    `json:"grpcPort"`
 	HTTPPort              string                    `json:"httpPort"`
 	HTTP3Port             string                    `json:"http3Port"`
@@ -64,30 +65,31 @@ type Config struct {
 	LoadBalancingStrategy string                    `json:"loadBalancingStrategy"`
 
 	// New optimization settings
-	MaxConcurrentRequests int      `json:"maxConcurrentRequests"`
-	RequestTimeout        string   `json:"requestTimeout"`
-	EnableMetrics         bool     `json:"enableMetrics"`
-	MetricsPort           string   `json:"metricsPort"`
-	EnableHealthCheck     bool     `json:"enableHealthCheck"`
-	HealthCheckPath       string   `json:"healthCheckPath"`
-	ConnectionPoolSize    int      `json:"connectionPoolSize"`
-	EnableRateLimit       bool     `json:"enableRateLimit"`
-	RateLimitPerSecond    int      `json:"rateLimitPerSecond"`
-	EnableCompression     bool     `json:"enableCompression"`
-	MaxHeaderSize         int      `json:"maxHeaderSize"`
-	ReadTimeout           string   `json:"readTimeout"`
-	WriteTimeout          string   `json:"writeTimeout"`
-	IdleTimeout           string   `json:"idleTimeout"`
-	MaxRequestBodySize    int64    `json:"maxRequestBodySize"`
-	EnableCORS            bool     `json:"enableCORS"`
-	CORSAllowedOrigins    string   `json:"corsAllowedOrigins"`
-	GracefulShutdownDelay string   `json:"gracefulShutdownDelay"`
-	EnableAdminUI         bool     `json:"enableAdminUI"`
-	AdminPath             string   `json:"adminPath"`
-	AdminUsername         string   `json:"adminUsername"`
-	AdminPassword         string   `json:"adminPassword"`
-	AdminInsecureSkipAuth bool     `json:"adminInsecureSkipAuth"`
-	AdminAllowedCIDRs     []string `json:"adminAllowedCIDRs"`
+	MaxConcurrentRequests   int      `json:"maxConcurrentRequests"`
+	MaxConcurrentWebSockets int      `json:"maxConcurrentWebSockets"`
+	RequestTimeout          string   `json:"requestTimeout"`
+	EnableMetrics           bool     `json:"enableMetrics"`
+	MetricsPort             string   `json:"metricsPort"`
+	EnableHealthCheck       bool     `json:"enableHealthCheck"`
+	HealthCheckPath         string   `json:"healthCheckPath"`
+	ConnectionPoolSize      int      `json:"connectionPoolSize"`
+	EnableRateLimit         bool     `json:"enableRateLimit"`
+	RateLimitPerSecond      int      `json:"rateLimitPerSecond"`
+	EnableCompression       bool     `json:"enableCompression"`
+	MaxHeaderSize           int      `json:"maxHeaderSize"`
+	ReadTimeout             string   `json:"readTimeout"`
+	WriteTimeout            string   `json:"writeTimeout"`
+	IdleTimeout             string   `json:"idleTimeout"`
+	MaxRequestBodySize      int64    `json:"maxRequestBodySize"`
+	EnableCORS              bool     `json:"enableCORS"`
+	CORSAllowedOrigins      string   `json:"corsAllowedOrigins"`
+	GracefulShutdownDelay   string   `json:"gracefulShutdownDelay"`
+	EnableAdminUI           bool     `json:"enableAdminUI"`
+	AdminPath               string   `json:"adminPath"`
+	AdminUsername           string   `json:"adminUsername"`
+	AdminPassword           string   `json:"adminPassword"`
+	AdminInsecureSkipAuth   bool     `json:"adminInsecureSkipAuth"`
+	AdminAllowedCIDRs       []string `json:"adminAllowedCIDRs"`
 }
 
 type AllowedRegistrationRule struct {
@@ -116,6 +118,9 @@ type Metrics struct {
 	BackendsRegistered *expvar.Int
 	RouteRequests      *expvar.Map
 	RateLimited        *expvar.Int
+	InflightRequests   *expvar.Int
+	ActiveWebSockets   *expvar.Int
+	ActiveStreams      *expvar.Int
 	routeMetrics       sync.Map
 	unmatched          *routeMetrics
 }
@@ -137,6 +142,7 @@ var (
 const (
 	loadBalancingRoundRobin = "round_robin"
 	loadBalancingFirst      = "first"
+	loadBalancingLeast      = "least_connections"
 )
 
 var schedulerMetricNames = []string{
@@ -162,6 +168,9 @@ func initMetrics() {
 		BackendsRegistered: expvar.NewInt("backends_registered"),
 		RouteRequests:      expvar.NewMap("route_requests_total"),
 		RateLimited:        expvar.NewInt("rate_limited_total"),
+		InflightRequests:   expvar.NewInt("inflight_requests"),
+		ActiveWebSockets:   expvar.NewInt("active_websockets"),
+		ActiveStreams:      expvar.NewInt("active_streams"),
 	}
 	metrics.unmatched = metrics.routeMetricsFor("_unmatched")
 }
@@ -244,6 +253,9 @@ func NewMemoryCache() *MemoryCache {
 	maxItems := 1000 // Default max items
 	if config.CacheMaxItems > 0 {
 		maxItems = config.CacheMaxItems
+	} else if legacyCompatibilityEnabled() && config.ConnectionPoolSize > 0 {
+		// HARP v1 used connectionPoolSize solely as the cache-size input.
+		maxItems = config.ConnectionPoolSize * 10
 	}
 	return &MemoryCache{
 		items:    make(map[string]cacheItem),
@@ -708,10 +720,11 @@ func lowerASCII(char byte) byte {
 
 // --- Global registries for backends and pending responses ---
 type backendConn struct {
-	stream pb.HarpService_ProxyServer
-	routes []registeredRoute
-	mu     sync.Mutex // protects stream writes
-	failed atomic.Bool
+	stream   pb.HarpService_ProxyServer
+	routes   []registeredRoute
+	mu       sync.Mutex // protects stream writes
+	failed   atomic.Bool
+	inflight atomic.Int64
 }
 
 type backendPool struct {
@@ -765,6 +778,9 @@ type metricsResponse struct {
 	ActiveConnections  int64               `json:"active_connections"`
 	BackendsRegistered int64               `json:"backends_registered"`
 	RateLimited        int64               `json:"rate_limited"`
+	InflightRequests   int64               `json:"inflight_requests"`
+	ActiveWebSockets   int64               `json:"active_websockets"`
+	ActiveStreams      int64               `json:"active_streams"`
 	MemoryStats        memoryStatsSnapshot `json:"memory_stats"`
 	RuntimeScheduler   map[string]uint64   `json:"runtime_scheduler"`
 	RouteRequests      map[string]int64    `json:"route_requests"`
@@ -777,13 +793,15 @@ type cacheStatsSnapshot struct {
 }
 
 type adminProxySnapshot struct {
-	GRPCPort              string `json:"grpcPort"`
-	HTTPPort              string `json:"httpPort"`
-	CacheEnabled          bool   `json:"cacheEnabled"`
-	CacheType             string `json:"cacheType"`
-	RateLimit             bool   `json:"rateLimit"`
-	MaxConcurrent         int    `json:"maxConcurrent"`
-	LoadBalancingStrategy string `json:"loadBalancingStrategy"`
+	GRPCPort                string `json:"grpcPort"`
+	HTTPPort                string `json:"httpPort"`
+	CompatibilityMode       string `json:"compatibilityMode,omitempty"`
+	CacheEnabled            bool   `json:"cacheEnabled"`
+	CacheType               string `json:"cacheType"`
+	RateLimit               bool   `json:"rateLimit"`
+	MaxConcurrent           int    `json:"maxConcurrent"`
+	MaxConcurrentWebSockets int    `json:"maxConcurrentWebSockets"`
+	LoadBalancingStrategy   string `json:"loadBalancingStrategy"`
 }
 
 type adminSecuritySnapshot struct {
@@ -801,6 +819,9 @@ type adminCounterSnapshot struct {
 	ActiveConnections  int64 `json:"activeConnections"`
 	BackendsRegistered int64 `json:"backendsRegistered"`
 	RateLimited        int64 `json:"rateLimited"`
+	InflightRequests   int64 `json:"inflightRequests"`
+	ActiveWebSockets   int64 `json:"activeWebSockets"`
+	ActiveStreams      int64 `json:"activeStreams"`
 	CacheSize          int   `json:"cacheSize"`
 }
 
@@ -873,6 +894,7 @@ var (
 	pendingWebSockets       = newShardedStore[*proxyWebSocketTunnel]()
 	startTime               time.Time
 	requestSem              chan struct{}
+	websocketSem            chan struct{}
 	servers                 runningServerRegistry
 	shuttingDown            atomic.Bool
 	routeSnapshotGeneration atomic.Uint64
@@ -1013,6 +1035,9 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		ActiveConnections:  metrics.ActiveConnections.Value(),
 		BackendsRegistered: metrics.BackendsRegistered.Value(),
 		RateLimited:        metrics.RateLimited.Value(),
+		InflightRequests:   metrics.InflightRequests.Value(),
+		ActiveWebSockets:   metrics.ActiveWebSockets.Value(),
+		ActiveStreams:      metrics.ActiveStreams.Value(),
 		MemoryStats:        runtimeStats.memory,
 		RuntimeScheduler:   runtimeStats.scheduler,
 		RouteRequests:      expvarIntMapSnapshot(metrics.RouteRequests),
@@ -1052,13 +1077,15 @@ func adminStatusHandler(w http.ResponseWriter, r *http.Request) {
 		Status: "healthy",
 		Uptime: time.Since(startTime).Seconds(),
 		Proxy: adminProxySnapshot{
-			GRPCPort:              config.GRPCPort,
-			HTTPPort:              config.HTTPPort,
-			CacheEnabled:          config.EnableCache,
-			CacheType:             config.CacheType,
-			RateLimit:             config.EnableRateLimit,
-			MaxConcurrent:         config.MaxConcurrentRequests,
-			LoadBalancingStrategy: config.LoadBalancingStrategy,
+			GRPCPort:                config.GRPCPort,
+			HTTPPort:                config.HTTPPort,
+			CompatibilityMode:       config.CompatibilityMode,
+			CacheEnabled:            config.EnableCache,
+			CacheType:               config.CacheType,
+			RateLimit:               config.EnableRateLimit,
+			MaxConcurrent:           config.MaxConcurrentRequests,
+			MaxConcurrentWebSockets: config.MaxConcurrentWebSockets,
+			LoadBalancingStrategy:   config.LoadBalancingStrategy,
 		},
 		Admin: adminSecuritySnapshot{
 			Path:              adminPath(),
@@ -1075,6 +1102,9 @@ func adminStatusHandler(w http.ResponseWriter, r *http.Request) {
 			ActiveConnections:  metrics.ActiveConnections.Value(),
 			BackendsRegistered: metrics.BackendsRegistered.Value(),
 			RateLimited:        metrics.RateLimited.Value(),
+			InflightRequests:   metrics.InflightRequests.Value(),
+			ActiveWebSockets:   metrics.ActiveWebSockets.Value(),
+			ActiveStreams:      metrics.ActiveStreams.Value(),
 			CacheSize:          cacheSize,
 		},
 		RuntimeScheduler: runtimeStats.scheduler,
@@ -1286,14 +1316,22 @@ func (s *harpService) Proxy(stream pb.HarpService_ProxyServer) error {
 		if routeDomain == "" {
 			routeDomain = reg.Domain
 		}
-		domainPattern, err := regexp.Compile("^(?:" + routeDomain + ")$")
+		var pattern, domainPattern *regexp.Regexp
+		var err error
+		if legacyCompatibilityEnabled() {
+			// HARP v1 treated the concatenated domain and path as one regexp.
+			pattern, err = regexp.Compile(routeDomain + r.Path)
+		} else {
+			domainPattern, err = regexp.Compile("^(?:" + routeDomain + ")$")
+		}
 		if err != nil {
-			logError("Error compiling domain regexp for route %s: %v", r.Path, err)
+			logError("Error compiling route %s: %v", r.Path, err)
 			continue
 		}
 		authRule, _ := allowedRegistrationFor(r.Path, reg.Key)
 		route := registeredRoute{
 			name:          r.Name,
+			pattern:       pattern,
 			domainPattern: domainPattern,
 			domain:        routeDomain,
 			path:          r.Path,
@@ -1377,8 +1415,10 @@ func addBackendToPool(key string, route registeredRoute, conn *backendConn) bool
 		backends[key] = pool
 		backendIndex = append(backendIndex, pool)
 		sortBackendIndex(backendIndex)
-		backendPathIndex[route.path] = append(backendPathIndex[route.path], pool)
-		backendIndexedPools++
+		if route.pattern == nil {
+			backendPathIndex[route.path] = append(backendPathIndex[route.path], pool)
+			backendIndexedPools++
+		}
 		routeSnapshotGeneration.Add(1)
 		return true
 	}
@@ -1387,7 +1427,7 @@ func addBackendToPool(key string, route registeredRoute, conn *backendConn) bool
 			return true
 		}
 	}
-	if config.ConnectionPoolSize > 0 && len(pool.conns) >= config.ConnectionPoolSize {
+	if limit := backendConnectionPoolLimit(); limit > 0 && len(pool.conns) >= limit {
 		return false
 	}
 	pool.conns = append(pool.conns, conn)
@@ -1519,6 +1559,19 @@ func deliverPendingWebSocket(ctx context.Context, data *pb.WebSocketData, tunnel
 	}
 }
 
+func acquireConcurrencySlot(w http.ResponseWriter, semaphore chan struct{}, message string) bool {
+	if semaphore == nil {
+		return true
+	}
+	select {
+	case semaphore <- struct{}{}:
+		return true
+	default:
+		http.Error(w, message, http.StatusServiceUnavailable)
+		return false
+	}
+}
+
 // --- HTTP Handler for Client Requests ---
 func httpHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
@@ -1546,14 +1599,18 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if requestSem != nil {
-		select {
-		case requestSem <- struct{}{}:
-			defer func() { <-requestSem }()
-		default:
-			http.Error(w, "Server busy", http.StatusServiceUnavailable)
-			return
-		}
+	isWS := isWebSocketUpgrade(r)
+	requestSemaphore := requestSem
+	busyMessage := "Server busy"
+	if isWS {
+		requestSemaphore = websocketSem
+		busyMessage = "WebSocket capacity exhausted"
+	}
+	if !acquireConcurrencySlot(w, requestSemaphore, busyMessage) {
+		return
+	}
+	if requestSemaphore != nil {
+		defer func() { <-requestSemaphore }()
 	}
 
 	// Rate limiting
@@ -1587,6 +1644,15 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		authenticatedRoute = true
 	}
+	inflightConn := chosen
+	inflightConn.inflight.Add(1)
+	metrics.InflightRequests.Add(1)
+	defer func() {
+		if inflightConn != nil {
+			inflightConn.inflight.Add(-1)
+		}
+		metrics.InflightRequests.Add(-1)
+	}()
 
 	bodyBytes, err := readRequestBody(r, config.MaxRequestBodySize)
 	if err != nil {
@@ -1602,7 +1668,6 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	reqID := uuid.New().String()
 	edgeRequestID := requestIDFromRequest(r)
 	w.Header().Set("X-Request-ID", edgeRequestID)
-	isWS := isWebSocketUpgrade(r)
 	forwardHeaders := forwardedRequestHeaders(r)
 	if isWS {
 		forwardHeaders = websocketForwardedRequestHeaders(r)
@@ -1663,13 +1728,19 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	err = sendBackendMessage(chosen, serverMsg)
 	if err != nil {
 		chosen.failed.Store(true)
+		inflightConn.inflight.Add(-1)
+		inflightConn = nil
 		if isIdempotentMethod(r.Method) {
 			if replacement, _, _ := matchBackend(r.Host, r.URL.Path); replacement != nil && replacement != chosen {
 				logWarn("Backend send failed; retrying %s %s on another pooled connection", r.Method, r.URL.Path)
 				chosen = replacement
+				inflightConn = replacement
+				inflightConn.inflight.Add(1)
 				err = sendBackendMessage(chosen, serverMsg)
 				if err != nil {
 					chosen.failed.Store(true)
+					inflightConn.inflight.Add(-1)
+					inflightConn = nil
 				}
 			}
 		}
@@ -1696,6 +1767,10 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		bodyAllowed := responseBodyAllowed(r.Method, firstStatus)
 		if !bodyAllowed {
 			isStream = false
+		}
+		if isStream {
+			metrics.ActiveStreams.Add(1)
+			defer metrics.ActiveStreams.Add(-1)
 		}
 		firstHTTPHeaders := filterInternalHTTPHeaders(pb.HTTPHeaderFromProto(resp.Headers, resp.HeaderValues))
 		appendVia(firstHTTPHeaders)
@@ -1828,7 +1903,7 @@ func matchBackend(host, path string) (*backendConn, string, routeAuthConfig) {
 	}
 	for _, pool := range pools {
 		route := pool.route
-		if len(pool.conns) == 0 || !matchesRegisteredRoute(path, route.path) {
+		if len(pool.conns) == 0 || (route.pattern == nil && !matchesRegisteredRoute(path, route.path)) {
 			continue
 		}
 		domainMatches := false
@@ -1920,6 +1995,25 @@ func selectBackendConnection(pool *backendPool) *backendConn {
 		return nil
 	}
 	start := atomic.AddUint64(&pool.next, 1) - 1
+	if config.LoadBalancingStrategy == loadBalancingLeast {
+		var selected *backendConn
+		var selectedInflight int64
+		for offset := 0; offset < count; offset++ {
+			conn := pool.conns[int((start+uint64(offset))%uint64(count))]
+			if conn.failed.Load() {
+				continue
+			}
+			inflight := conn.inflight.Load()
+			if inflight == 0 {
+				return conn
+			}
+			if selected == nil || inflight < selectedInflight {
+				selected = conn
+				selectedInflight = inflight
+			}
+		}
+		return selected
+	}
 	for offset := 0; offset < count; offset++ {
 		conn := pool.conns[int((start+uint64(offset))%uint64(count))]
 		if !conn.failed.Load() {
@@ -1937,6 +2031,30 @@ func matchesRegisteredRoute(requestPath, routePath string) bool {
 		return false
 	}
 	return strings.HasSuffix(routePath, "/") || len(requestPath) == len(routePath) || requestPath[len(routePath)] == '/'
+}
+
+const compatibilityModeV1 = "v1"
+
+func normalizeCompatibilityMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "current":
+		return ""
+	case compatibilityModeV1, "legacy":
+		return compatibilityModeV1
+	default:
+		return "invalid"
+	}
+}
+
+func legacyCompatibilityEnabled() bool {
+	return normalizeCompatibilityMode(config.CompatibilityMode) == compatibilityModeV1
+}
+
+func backendConnectionPoolLimit() int {
+	if legacyCompatibilityEnabled() {
+		return 0
+	}
+	return config.ConnectionPoolSize
 }
 
 func routeTarget(host, path string) string {
@@ -2500,10 +2618,14 @@ func loadConfig(path string) {
 	if err := decoder.Decode(&config); err != nil {
 		log.Fatalf("Unable to decode config file: %v", err)
 	}
+	config.CompatibilityMode = normalizeCompatibilityMode(config.CompatibilityMode)
 
 	// Set defaults for new options
 	if config.MaxConcurrentRequests == 0 {
 		config.MaxConcurrentRequests = 1000
+	}
+	if config.MaxConcurrentWebSockets == 0 && !legacyCompatibilityEnabled() {
+		config.MaxConcurrentWebSockets = 256
 	}
 	if config.RequestTimeout == "" {
 		config.RequestTimeout = "30s"
@@ -2553,13 +2675,19 @@ func validateConfig(config Config) error {
 		errs = append(errs, errors.New("enableHTTP3 requires enableHTTPS"))
 	}
 	if normalizeLoadBalancingStrategy(config.LoadBalancingStrategy) == "" {
-		errs = append(errs, fmt.Errorf("invalid loadBalancingStrategy %q: use %q or %q", config.LoadBalancingStrategy, loadBalancingRoundRobin, loadBalancingFirst))
+		errs = append(errs, fmt.Errorf("invalid loadBalancingStrategy %q: use %q, %q, or %q", config.LoadBalancingStrategy, loadBalancingRoundRobin, loadBalancingFirst, loadBalancingLeast))
+	}
+	if normalizeCompatibilityMode(config.CompatibilityMode) == "invalid" {
+		errs = append(errs, errors.New("invalid compatibilityMode: use empty/current or v1/legacy"))
 	}
 	if config.EnableAdminUI && !config.AdminInsecureSkipAuth && config.AdminPassword == "" {
 		errs = append(errs, errors.New("enableAdminUI requires adminPassword unless adminInsecureSkipAuth is true"))
 	}
 	if config.ConnectionPoolSize < 0 {
 		errs = append(errs, errors.New("connectionPoolSize must not be negative"))
+	}
+	if config.MaxConcurrentWebSockets < 0 {
+		errs = append(errs, errors.New("maxConcurrentWebSockets must not be negative"))
 	}
 	if config.CacheMaxItems < 0 {
 		errs = append(errs, errors.New("cacheMaxItems must not be negative"))
@@ -2598,6 +2726,8 @@ func normalizeLoadBalancingStrategy(strategy string) string {
 		return loadBalancingRoundRobin
 	case loadBalancingFirst:
 		return loadBalancingFirst
+	case loadBalancingLeast, "least-connections", "leastconnections":
+		return loadBalancingLeast
 	default:
 		return ""
 	}
@@ -2636,6 +2766,9 @@ func main() {
 	logInfo("Enhanced HARP proxy starting with configuration: %s", *configPath)
 	if config.MaxConcurrentRequests > 0 {
 		requestSem = make(chan struct{}, config.MaxConcurrentRequests)
+	}
+	if config.MaxConcurrentWebSockets > 0 {
+		websocketSem = make(chan struct{}, config.MaxConcurrentWebSockets)
 	}
 
 	// Always initialize metrics (used in httpHandler unconditionally)

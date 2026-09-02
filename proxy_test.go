@@ -472,6 +472,25 @@ func TestMemoryCacheUsesIndependentCapacity(t *testing.T) {
 	}
 }
 
+func TestV1CompatibilityUsesLegacyCacheCapacity(t *testing.T) {
+	originalConfig := config
+	config.CompatibilityMode = compatibilityModeV1
+	config.ConnectionPoolSize = 7
+	config.CacheMaxItems = 0
+	t.Cleanup(func() { config = originalConfig })
+
+	cache := NewMemoryCache()
+	if cache.maxItems != 70 {
+		t.Fatalf("legacy cache capacity = %d, want 70", cache.maxItems)
+	}
+
+	config.CacheMaxItems = 11
+	cache = NewMemoryCache()
+	if cache.maxItems != 11 {
+		t.Fatalf("explicit cache capacity = %d, want 11", cache.maxItems)
+	}
+}
+
 func TestMemoryCacheEvictsExpiredFirst(t *testing.T) {
 	origTTL := config.CacheTTL
 	config.CacheTTL = "5ms"
@@ -810,6 +829,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if config.MaxConcurrentRequests != 1000 {
 		t.Errorf("expected default MaxConcurrentRequests=1000, got %d", config.MaxConcurrentRequests)
 	}
+	if config.MaxConcurrentWebSockets != 256 {
+		t.Errorf("expected default MaxConcurrentWebSockets=256, got %d", config.MaxConcurrentWebSockets)
+	}
 	if config.RequestTimeout != "30s" {
 		t.Errorf("expected default RequestTimeout='30s', got %q", config.RequestTimeout)
 	}
@@ -895,16 +917,17 @@ func TestShutdownRunningServersStopsHTTPServer(t *testing.T) {
 
 func TestValidateConfigCollectsErrors(t *testing.T) {
 	err := validateConfig(Config{
-		EnableGRPCTLS:         true,
-		EnableHTTPS:           true,
-		EnableHTTP3:           true,
-		EnableAdminUI:         true,
-		CacheTTL:              "not-a-duration",
-		ReadTimeout:           "still-not-a-duration",
-		LoadBalancingStrategy: "random",
-		AdminAllowedCIDRs:     []string{"not-a-cidr"},
-		ConnectionPoolSize:    -1,
-		CacheMaxItems:         -1,
+		EnableGRPCTLS:           true,
+		EnableHTTPS:             true,
+		EnableHTTP3:             true,
+		EnableAdminUI:           true,
+		CacheTTL:                "not-a-duration",
+		ReadTimeout:             "still-not-a-duration",
+		LoadBalancingStrategy:   "random",
+		AdminAllowedCIDRs:       []string{"not-a-cidr"},
+		ConnectionPoolSize:      -1,
+		CacheMaxItems:           -1,
+		MaxConcurrentWebSockets: -1,
 		AllowedRegistration: []AllowedRegistrationRule{
 			{Route: "[", Key: "secret"},
 		},
@@ -925,6 +948,7 @@ func TestValidateConfigCollectsErrors(t *testing.T) {
 		"invalid regex in allowedRegistration route",
 		"connectionPoolSize must not be negative",
 		"cacheMaxItems must not be negative",
+		"maxConcurrentWebSockets must not be negative",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("expected validation error %q in %q", want, msg)
@@ -1580,6 +1604,9 @@ func newTestMetrics() *Metrics {
 		BackendsRegistered: new(expvar.Int),
 		RouteRequests:      new(expvar.Map).Init(),
 		RateLimited:        new(expvar.Int),
+		InflightRequests:   new(expvar.Int),
+		ActiveWebSockets:   new(expvar.Int),
+		ActiveStreams:      new(expvar.Int),
 	}
 	m.unmatched = m.routeMetricsFor("_unmatched")
 	return m
@@ -1778,6 +1805,39 @@ func TestSelectBackendConnectionSkipsFailedConnections(t *testing.T) {
 	}
 }
 
+func TestSelectBackendConnectionUsesLeastInflight(t *testing.T) {
+	originalConfig := config
+	config.LoadBalancingStrategy = loadBalancingLeast
+	t.Cleanup(func() { config = originalConfig })
+	busy := &backendConn{}
+	idle := &backendConn{}
+	medium := &backendConn{}
+	busy.inflight.Store(8)
+	idle.inflight.Store(1)
+	medium.inflight.Store(4)
+	pool := &backendPool{conns: []*backendConn{busy, idle, medium}}
+	if got := selectBackendConnection(pool); got != idle {
+		t.Fatalf("selected %#v, want least-loaded connection", got)
+	}
+	idle.failed.Store(true)
+	if got := selectBackendConnection(pool); got != medium {
+		t.Fatalf("selected %#v, want least-loaded healthy connection", got)
+	}
+}
+
+func TestWebSocketSemaphoreIsIndependent(t *testing.T) {
+	requestSlots := make(chan struct{}, 1)
+	webSocketSlots := make(chan struct{}, 1)
+	requestSlots <- struct{}{}
+	rec := httptest.NewRecorder()
+	if !acquireConcurrencySlot(rec, webSocketSlots, "full") {
+		t.Fatal("free WebSocket slot was rejected because request slots were full")
+	}
+	if acquireConcurrencySlot(rec, webSocketSlots, "full") {
+		t.Fatal("full WebSocket capacity accepted another connection")
+	}
+}
+
 func TestBackendPoolCapacity(t *testing.T) {
 	originalConfig := config
 	originalBackends := backends
@@ -1810,6 +1870,62 @@ func TestBackendPoolCapacity(t *testing.T) {
 	}
 }
 
+func TestV1CompatibilityLeavesBackendPoolUnlimited(t *testing.T) {
+	originalConfig := config
+	config.CompatibilityMode = compatibilityModeV1
+	config.ConnectionPoolSize = 1
+	t.Cleanup(func() { config = originalConfig })
+
+	if limit := backendConnectionPoolLimit(); limit != 0 {
+		t.Fatalf("legacy backend pool limit = %d, want unlimited", limit)
+	}
+}
+
+func TestV1CompatibilityMatchesCombinedDomainPathRegexp(t *testing.T) {
+	originalConfig := config
+	originalBackends := backends
+	originalIndex := backendIndex
+	originalPathIndex := backendPathIndex
+	originalIndexedPools := backendIndexedPools
+	config.CompatibilityMode = compatibilityModeV1
+	backends = make(map[string]*backendPool)
+	backendIndex = nil
+	backendPathIndex = make(map[string][]*backendPool)
+	backendIndexedPools = 0
+	t.Cleanup(func() {
+		config = originalConfig
+		backends = originalBackends
+		backendIndex = originalIndex
+		backendPathIndex = originalPathIndex
+		backendIndexedPools = originalIndexedPools
+	})
+
+	pattern := regexp.MustCompile(`example\.com/api/[0-9]+$`)
+	route := registeredRoute{domain: `example\.com`, path: `/api/[0-9]+$`, pattern: pattern}
+	conn := &backendConn{}
+	if !addBackendToPool(backendKey(route.domain, route.path), route, conn) {
+		t.Fatal("legacy route registration was rejected")
+	}
+	if backendIndexedPools != 0 {
+		t.Fatalf("legacy regexp route entered literal-path index")
+	}
+
+	got, matched, _ := matchBackend("example.com:443", "/api/42")
+	if got != conn || matched != route.path {
+		t.Fatalf("legacy route match = (%p, %q), want (%p, %q)", got, matched, conn, route.path)
+	}
+	if got, _, _ := matchBackend("example.com", "/api/users"); got != nil {
+		t.Fatal("legacy regexp route matched an invalid path")
+	}
+}
+
+func TestValidateConfigRejectsUnknownCompatibilityMode(t *testing.T) {
+	err := validateConfig(Config{CompatibilityMode: "v0", LoadBalancingStrategy: loadBalancingRoundRobin})
+	if err == nil || !strings.Contains(err.Error(), "invalid compatibilityMode") {
+		t.Fatalf("validateConfig error = %v, want invalid compatibilityMode", err)
+	}
+}
+
 func TestIdempotentMethod(t *testing.T) {
 	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete, http.MethodOptions, http.MethodTrace} {
 		if !isIdempotentMethod(method) {
@@ -1833,6 +1949,25 @@ func BenchmarkBackendPoolSelectionParallel(b *testing.B) {
 		if i%4 == 0 {
 			pool.conns[i].failed.Store(true)
 		}
+	}
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if selectBackendConnection(pool) == nil {
+				b.Fatal("no healthy connection selected")
+			}
+		}
+	})
+}
+
+func BenchmarkBackendPoolLeastConnectionsParallel(b *testing.B) {
+	originalConfig := config
+	config.LoadBalancingStrategy = loadBalancingLeast
+	b.Cleanup(func() { config = originalConfig })
+	pool := &backendPool{conns: make([]*backendConn, 64)}
+	for i := range pool.conns {
+		pool.conns[i] = &backendConn{}
+		pool.conns[i].inflight.Store(int64(i%8 + 1))
 	}
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {

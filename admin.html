@@ -153,14 +153,18 @@ function render(data) {
     "</tr>"
   ).join("") : "<tr><td colspan=\"5\" class=\"empty\">No routes registered</td></tr>";
 
+  const counters = data.counters || {};
   const runtime = [
-    ["Goroutines", "/sched/goroutines:goroutines"],
-    ["Runnable", "/sched/goroutines/runnable:goroutines"],
-    ["Waiting", "/sched/goroutines/waiting:goroutines"],
-    ["Threads", "/sched/threads/total:threads"]
+    ["Inflight", counters.inflightRequests],
+    ["WebSockets", counters.activeWebSockets],
+    ["Streams", counters.activeStreams],
+    ["Goroutines", metricKey(data, "/sched/goroutines:goroutines")],
+    ["Runnable", metricKey(data, "/sched/goroutines/runnable:goroutines")],
+    ["Waiting", metricKey(data, "/sched/goroutines/waiting:goroutines")],
+    ["Threads", metricKey(data, "/sched/threads/total:threads")]
   ];
-  $("runtime").innerHTML = runtime.map(([label, key]) =>
-    "<div><strong>" + fmt(metricKey(data, key)) + "</strong><span class=\"label\">" + label + "</span></div>"
+  $("runtime").innerHTML = runtime.map(([label, value]) =>
+    "<div><strong>" + fmt(value) + "</strong><span class=\"label\">" + label + "</span></div>"
   ).join("");
   const proxy = data.proxy || {};
   const admin = data.admin || {};

@@ -1,4 +1,5 @@
 {
+  "compatibilityMode": "",
   "grpcPort": ":50054",
   "httpPort": ":8080",
   "http3Port": ":8445",
@@ -22,12 +23,14 @@
   "loadBalancingStrategy": "round_robin",
 
   "maxConcurrentRequests": 1000,
+  "maxConcurrentWebSockets": 256,
   "requestTimeout": "30s",
   "enableMetrics": true,
   "metricsPort": ":9091",
   "enableHealthCheck": true,
   "healthCheckPath": "/health",
   "connectionPoolSize": 100,
+  "cacheMaxItems": 1000,
   "enableRateLimit": true,
   "rateLimitPerSecond": 100,
   "enableCompression": true,
