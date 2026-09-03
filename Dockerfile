@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.25-alpine AS build
+FROM golang:1.26.3-alpine AS build
 
 WORKDIR /src
 RUN apk add --no-cache ca-certificates git
@@ -8,6 +8,8 @@ RUN apk add --no-cache ca-certificates git
 COPY go.mod go.sum go.work go.work.sum ./
 COPY harp/go.mod harp/go.sum ./harp/
 COPY harpserver/go.mod harpserver/go.sum ./harpserver/
+COPY demos/advanced-enterprise/go.mod demos/advanced-enterprise/go.sum ./demos/advanced-enterprise/
+COPY demos/remote-helper-go/go.mod demos/remote-helper-go/go.sum ./demos/remote-helper-go/
 RUN go mod download
 
 COPY . .
